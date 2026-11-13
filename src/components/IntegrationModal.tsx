@@ -12,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import type { DownloadJob, IntegrationConfig } from '../types';
+import { apiFetch, getBackendBaseUrl } from '../utils/api';
 
 interface IntegrationModalProps {
   isOpen: boolean;
@@ -39,7 +40,8 @@ export function IntegrationModal({
   const [copiedEndpoint, setCopiedEndpoint] = useState<boolean>(false);
   const [selectedLyricsJob, setSelectedLyricsJob] = useState<DownloadJob | null>(null);
 
-  const apiEndpointUrl = `${window.location.origin}/api/external/tracks`;
+  const base = getBackendBaseUrl();
+  const apiEndpointUrl = `${base || window.location.origin}/api/external/tracks`;
 
   useEffect(() => {
     if (!isOpen) return;
@@ -47,7 +49,7 @@ export function IntegrationModal({
     (async () => {
       setIsLoading(true);
       try {
-        const res = await fetch('/api/integration/settings');
+        const res = await apiFetch('/api/integration/settings');
         if (!res.ok) return;
         const data = (await res.json()) as IntegrationConfig;
         if (!cancelled) setConfig(data);
@@ -65,7 +67,7 @@ export function IntegrationModal({
   const handleSaveSettings = async (regenerate = false) => {
     setIsSaving(true);
     try {
-      const res = await fetch('/api/integration/settings', {
+      const res = await apiFetch('/api/integration/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -93,7 +95,7 @@ export function IntegrationModal({
     setIsTesting(true);
     setTestResult(null);
     try {
-      const res = await fetch('/api/external/webhook-test', {
+      const res = await apiFetch('/api/external/webhook-test', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

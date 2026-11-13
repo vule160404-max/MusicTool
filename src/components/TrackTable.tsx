@@ -29,6 +29,7 @@ interface TrackTableProps {
   bitrate: AudioBitrate;
   onResetToDefaultChart: () => void;
   downloadedTrackIds: Set<string>;
+  onOpenBackendSettings?: () => void;
 }
 
 function formatDuration(ms: number): string {
@@ -113,6 +114,7 @@ export function TrackTable({
   bitrate,
   onResetToDefaultChart,
   downloadedTrackIds,
+  onOpenBackendSettings,
 }: TrackTableProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -151,24 +153,46 @@ export function TrackTable({
   }
 
   if (errorMessage) {
+    const isBackendError =
+      errorMessage.toLowerCase().includes('máy chủ') ||
+      errorMessage.toLowerCase().includes('backend') ||
+      errorMessage.toLowerCase().includes('kết nối') ||
+      errorMessage.toLowerCase().includes('vercel');
+
     return (
-      <div className="px-6 py-16 flex flex-col items-center justify-center text-center max-w-md mx-auto space-y-4">
+      <div className="px-6 py-16 flex flex-col items-center justify-center text-center max-w-lg mx-auto space-y-4">
         <div className="h-11 w-11 rounded-md bg-red-500/10 border border-red-500/25 flex items-center justify-center text-red-400">
           <AlertCircle className="h-5 w-5" />
         </div>
         <div className="space-y-1.5">
           <h3 className="text-base font-semibold text-white">
-            Không thể lấy danh sách từ Spotify
+            {isBackendError ? 'Chưa kết nối được Máy chủ Backend' : 'Không thể lấy danh sách từ Spotify'}
           </h3>
           <p className="text-sm text-slate-400">{errorMessage}</p>
+          {isBackendError && (
+            <p className="text-xs text-amber-300/80 pt-1">
+              Khi deploy lên Vercel, Vercel chỉ chạy web tĩnh và không chạy được máy chủ Node.js/FFmpeg.
+            </p>
+          )}
         </div>
-        <button
-          type="button"
-          onClick={onResetToDefaultChart}
-          className="px-4 py-2 rounded-md bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-sm font-semibold transition-colors cursor-pointer"
-        >
-          Mở lại Top 50 - Việt Nam
-        </button>
+        <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+          {isBackendError && onOpenBackendSettings && (
+            <button
+              type="button"
+              onClick={onOpenBackendSettings}
+              className="px-4 py-2 rounded-md bg-amber-500 hover:bg-amber-400 text-[#090B0E] text-xs font-semibold transition-colors cursor-pointer"
+            >
+              Cấu hình Backend / Xem cách sửa
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onResetToDefaultChart}
+            className="px-4 py-2 rounded-md bg-white/[0.08] hover:bg-white/[0.14] text-white text-xs font-medium transition-colors cursor-pointer"
+          >
+            Thử tải lại
+          </button>
+        </div>
       </div>
     );
   }

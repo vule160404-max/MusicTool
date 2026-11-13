@@ -1,5 +1,6 @@
 import express from 'express';
 import type { Request, Response } from 'express';
+import cors from 'cors';
 import { createServer as createViteServer } from 'vite';
 import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
@@ -972,6 +973,7 @@ async function startServer() {
   ensureYtDlp().catch(() => {});
 
   const app = express();
+  app.use(cors());
   app.use(express.json({ limit: '2mb' }));
 
   app.get('/api/health', (_req: Request, res: Response) => {

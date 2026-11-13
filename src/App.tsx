@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Check,
   Copy,
   Download,
@@ -7,6 +8,7 @@ import {
   FileText,
   Loader2,
   Menu,
+  Server,
   Webhook,
 } from 'lucide-react';
 import { Sidebar } from './components/Sidebar';
@@ -14,6 +16,9 @@ import { BatchExtractorBar } from './components/BatchExtractorBar';
 import { TrackTable } from './components/TrackTable';
 import { AudioPlayerDock } from './components/AudioPlayerDock';
 import { IntegrationModal } from './components/IntegrationModal';
+import { BackendConnectionModal } from './components/BackendConnectionModal';
+import { DEFAULT_PRESET_CHARTS } from './constants/presets';
+import { apiFetch, checkBackendStatus, getBackendBaseUrl } from './utils/api';
 import type {
   AudioBitrate,
   DownloadJob,
@@ -24,8 +29,8 @@ import type {
 const MAX_CONCURRENT_DOWNLOADS = 3;
 
 export default function App() {
-  const [presets, setPresets] = useState<PresetChart[]>([]);
-  const [activePresetId, setActivePresetId] = useState<string | null>(null);
+  const [presets, setPresets] = useState<PresetChart[]>(DEFAULT_PRESET_CHARTS);
+  const [activePresetId, setActivePresetId] = useState<string | null>(DEFAULT_PRESET_CHARTS[1].id);
   const [sourceTitle, setSourceTitle] = useState<string>('Top 50 - Việt Nam');
   const [tracks, setTracks] = useState<SpotifyTrackItem[]>([]);
   const [isExtracting, setIsExtracting] = useState<boolean>(true);
@@ -55,6 +60,8 @@ export default function App() {
 
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState<boolean>(false);
   const [isIntegrationModalOpen, setIsIntegrationModalOpen] = useState<boolean>(false);
+  const [isBackendModalOpen, setIsBackendModalOpen] = useState<boolean>(false);
+  const [isBackendOnline, setIsBackendOnline] = useState<boolean | null>(null);
 
   // Download queue & jobs keyed by trackId
   const [jobsByTrackId, setJobsByTrackId] = useState<Record<string, DownloadJob>>({});
@@ -101,8 +108,9 @@ export default function App() {
   }, []);
 
   const triggerBrowserSave = useCallback((job: DownloadJob) => {
+    const base = getBackendBaseUrl();
     const a = document.createElement('a');
-    a.href = `/api/download/file/${encodeURIComponent(job.jobId)}`;
+    a.href = `${base}/api/download/file/${encodeURIComponent(job.jobId)}`;
     a.download = job.fileName || `${job.artist} - ${job.title}.mp3`;
     document.body.appendChild(a);
     a.click();
@@ -114,7 +122,7 @@ export default function App() {
     for (let i = 0; i < loadedTracks.length; i += chunkSize) {
       const slice = loadedTracks.slice(i, i + chunkSize);
       try {
-        const res = await fetch('/api/spotify/covers', {
+        const res = await apiFetch('/api/spotify/covers', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ trackUrls: slice.map((t) => t.spotifyUrl) }),
@@ -128,7 +136,7 @@ export default function App() {
           );
         }
       } catch {
-        // Ignore
+        // Ignore non-critical thumbnail hydration errors
       }
     }
   }, []);
@@ -145,7 +153,7 @@ export default function App() {
       }
 
       try {
-        const res = await fetch('/api/spotify/extract', {
+        const res = await apiFetch('/api/spotify/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ urls }),
@@ -158,14 +166,15 @@ export default function App() {
         if (!res.ok || !data.tracks) {
           throw new Error(data.error || 'Không thể tải danh sách bài hát.');
         }
+        setIsBackendOnline(true);
         setSourceTitle(preset?.label || data.sourceTitle || 'Danh sách Spotify');
         setTracks(data.tracks);
         setSelectedIds(new Set(data.tracks.slice(0, 10).map((t) => t.id)));
         hydrateTrackCovers(data.tracks);
       } catch (err) {
-        setExtractError(
-          err instanceof Error ? err.message : 'Lỗi kết nối khi lấy dữ liệu Spotify.'
-        );
+        const msg = err instanceof Error ? err.message : 'Lỗi kết nối khi lấy dữ liệu Spotify.';
+        setExtractError(msg);
+        setIsBackendOnline(false);
         setTracks([]);
         setSelectedIds(new Set());
       } finally {
@@ -175,31 +184,35 @@ export default function App() {
     [hydrateTrackCovers]
   );
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
+  const initData = useCallback(async () => {
+    try {
+      const status = await checkBackendStatus();
+      setIsBackendOnline(status.ok);
+
+      // Try fetching dynamic presets from backend, otherwise fall back to DEFAULT_PRESET_CHARTS
       try {
-        const res = await fetch('/api/presets');
-        const data = (await res.json()) as { presets?: PresetChart[] };
-        const list = data.presets || [];
-        if (cancelled) return;
-        setPresets(list);
-        if (list[0]) {
-          await fetchCollection(list[0].spotifyUrl, list[0]);
-        } else {
-          setIsExtracting(false);
+        const res = await apiFetch('/api/presets');
+        if (res.ok) {
+          const data = (await res.json()) as { presets?: PresetChart[] };
+          if (data.presets && data.presets.length > 0) {
+            setPresets(data.presets);
+          }
         }
       } catch {
-        if (!cancelled) {
-          setExtractError('Không thể kết nối máy chủ.');
-          setIsExtracting(false);
-        }
+        // Fallback already in state
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
+
+      const initialPreset = DEFAULT_PRESET_CHARTS[1] || DEFAULT_PRESET_CHARTS[0];
+      await fetchCollection(initialPreset.spotifyUrl, initialPreset);
+    } catch {
+      setIsBackendOnline(false);
+      setIsExtracting(false);
+    }
   }, [fetchCollection]);
+
+  useEffect(() => {
+    initData();
+  }, [initData]);
 
   const pumpDownloadQueue = useCallback(async () => {
     while (
@@ -211,7 +224,7 @@ export default function App() {
 
       activeCountRef.current += 1;
       try {
-        const res = await fetch('/api/download/start', {
+        const res = await apiFetch('/api/download/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -335,7 +348,7 @@ export default function App() {
 
     const timer = setInterval(async () => {
       try {
-        const res = await fetch('/api/download/statuses', {
+        const res = await apiFetch('/api/download/statuses', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ jobIds: activeJobs.map((j) => j.jobId) }),
@@ -488,7 +501,7 @@ export default function App() {
     if (batchSummary.doneJobs.length === 0 || isZipping) return;
     setIsZipping(true);
     try {
-      const res = await fetch('/api/download/zip', {
+      const res = await apiFetch('/api/download/zip', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -529,10 +542,11 @@ export default function App() {
       return;
     }
 
+    const base = getBackendBaseUrl();
     const isFullMp3 = job?.state === 'done' || downloadedTrackIds.has(track.id);
     const srcUrl =
       isFullMp3 && job?.jobId
-        ? `/api/download/file/${encodeURIComponent(job.jobId)}?preview=1`
+        ? `${base}/api/download/file/${encodeURIComponent(job.jobId)}?preview=1`
         : track.previewUrl;
 
     if (!srcUrl) {
@@ -586,6 +600,25 @@ export default function App() {
       />
 
       <div className="flex-1 flex flex-col min-w-0">
+        {/* Top Backend Offline Warning Banner (shows on Vercel static deployments) */}
+        {isBackendOnline === false && (
+          <div className="bg-amber-500/15 border-b border-amber-500/30 px-4 sm:px-6 py-2 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />
+              <span>
+                <strong>Chưa kết nối Máy chủ Backend Node.js</strong> (Vercel chỉ chạy web tĩnh và không chạy được FFmpeg).
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsBackendModalOpen(true)}
+              className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0E] font-semibold text-xs transition-colors cursor-pointer"
+            >
+              Cấu hình Backend / Xem cách sửa
+            </button>
+          </div>
+        )}
+
         <header className="sticky top-0 z-20 flex items-center justify-between gap-4 border-b border-white/[0.08] bg-[#090B0E]/95 backdrop-blur-md px-4 sm:px-6 py-3.5">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -617,12 +650,29 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Backend Server Status / Config Button */}
+            <button
+              type="button"
+              onClick={() => setIsBackendModalOpen(true)}
+              title="Cấu hình kết nối máy chủ Backend"
+              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-md border text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                isBackendOnline === false
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+                  : 'border-white/[0.1] bg-white/[0.04] text-slate-300 hover:text-white hover:bg-white/[0.08]'
+              }`}
+            >
+              <Server className="h-3.5 w-3.5" />
+              <span className="hidden xl:inline">
+                {isBackendOnline === false ? 'Máy chủ: Chưa kết nối' : 'Máy chủ: Node.js'}
+              </span>
+            </button>
+
             <button
               type="button"
               onClick={() => setIsIntegrationModalOpen(true)}
               title="Liên kết với app nhạc của bạn qua API hoặc Webhook"
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md border border-[#1DB954]/40 bg-[#1DB954]/10 hover:bg-[#1DB954]/20 text-xs font-medium text-[#1DB954] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-[#1DB954]/40 bg-[#1DB954]/10 hover:bg-[#1DB954]/20 text-xs font-medium text-[#1DB954] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Webhook className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Liên kết App Nhạc</span>
@@ -632,12 +682,12 @@ export default function App() {
               type="button"
               onClick={handleCopyBatchLinks}
               disabled={tracks.length === 0}
-              className="hidden sm:inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md border border-white/[0.1] bg-white/[0.04] hover:bg-white/[0.09] disabled:opacity-40 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-white/[0.1] bg-white/[0.04] hover:bg-white/[0.09] disabled:opacity-40 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               {copiedBatch ? (
                 <>
                   <Check className="h-3.5 w-3.5 text-[#1DB954]" />
-                  <span>Đã chép Link</span>
+                  <span>Đã chép</span>
                 </>
               ) : (
                 <>
@@ -664,7 +714,7 @@ export default function App() {
               type="button"
               onClick={handleDownloadBatch}
               disabled={tracks.length === 0 || isExtracting}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-45 disabled:pointer-events-none text-[#090B0E] text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-md bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-45 disabled:pointer-events-none text-[#090B0E] text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               {batchSummary.activeJobs.length > 0 ? (
                 <>
@@ -786,11 +836,11 @@ export default function App() {
             bitrate={bitrate}
             onResetToDefaultChart={() => {
               setFilterQuery('');
-              if (presets[0]) {
-                fetchCollection(presets[0].spotifyUrl, presets[0]);
-              }
+              const initialPreset = DEFAULT_PRESET_CHARTS[1] || DEFAULT_PRESET_CHARTS[0];
+              fetchCollection(initialPreset.spotifyUrl, initialPreset);
             }}
             downloadedTrackIds={downloadedTrackIds}
+            onOpenBackendSettings={() => setIsBackendModalOpen(true)}
           />
         </main>
 
@@ -816,6 +866,15 @@ export default function App() {
           isOpen={isIntegrationModalOpen}
           onClose={() => setIsIntegrationModalOpen(false)}
           completedJobs={batchSummary.doneJobs}
+          showToast={showToast}
+        />
+
+        <BackendConnectionModal
+          isOpen={isBackendModalOpen}
+          onClose={() => setIsBackendModalOpen(false)}
+          onConnectionSuccess={() => {
+            initData();
+          }}
           showToast={showToast}
         />
       </div>
