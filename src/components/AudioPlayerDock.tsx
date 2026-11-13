@@ -1,10 +1,10 @@
 import { Pause, Play, Volume2, X } from 'lucide-react';
-import type { SpotifyTrackItem } from '../types';
 
 interface AudioPlayerDockProps {
-  track: SpotifyTrackItem;
+  title: string;
+  artist: string;
+  sourceLabel: string;
   isPlaying: boolean;
-  isFullMp3: boolean;
   currentTime: number;
   duration: number;
   onTogglePlayPause: () => void;
@@ -20,9 +20,10 @@ function formatSec(sec: number): string {
 }
 
 export function AudioPlayerDock({
-  track,
+  title,
+  artist,
+  sourceLabel,
   isPlaying,
-  isFullMp3,
   currentTime,
   duration,
   onTogglePlayPause,
@@ -51,14 +52,12 @@ export function AudioPlayerDock({
 
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium text-white truncate">
-                {track.title}
-              </span>
+              <span className="text-sm font-medium text-white truncate">{title}</span>
               <span className="text-xs text-slate-400 shrink-0 hidden sm:inline">
-                · {isFullMp3 ? 'Bản đầy đủ MP3' : 'Nghe thử 30s'}
+                · {sourceLabel}
               </span>
             </div>
-            <div className="text-xs text-slate-400 truncate">{track.artist}</div>
+            <div className="text-xs text-slate-400 truncate">{artist || 'Chưa rõ ca sĩ'}</div>
           </div>
         </div>
 

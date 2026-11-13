@@ -38,10 +38,42 @@ export function IntegrationModal({
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState<boolean>(false);
   const [copiedEndpoint, setCopiedEndpoint] = useState<boolean>(false);
+  const [copiedEnrichEndpoint, setCopiedEnrichEndpoint] = useState<boolean>(false);
+  const [copiedPrompt, setCopiedPrompt] = useState<boolean>(false);
   const [selectedLyricsJob, setSelectedLyricsJob] = useState<DownloadJob | null>(null);
 
   const base = getBackendBaseUrl();
-  const apiEndpointUrl = `${base || window.location.origin}/api/external/tracks`;
+  const originBase = base || window.location.origin;
+  const apiEndpointUrl = `${originBase}/api/external/tracks`;
+  const enrichEndpointUrl = `${originBase}/api/external/enrich`;
+
+  const r2PromptText = `Hãy thiết kế chức năng Upload file MP3 lên App Nhạc và tự động tìm Ảnh Bìa + Lyrics để lưu lên Cloudflare R2 như sau:
+
+1. Khi người dùng chọn/upload 1 hoặc nhiều file .mp3 lên App (file gốc chưa có ảnh bìa và lyrics):
+   - Trước khi lưu lên Cloudflare R2, gọi API làm giàu dữ liệu của SpotFlow:
+     POST ${enrichEndpointUrl}
+     Headers: { "Content-Type": "application/json", "X-API-Key": "${config.apiKey || '<API_KEY>'}" }
+     Body: { "fileName": file.name, "title": parsedTitle, "artist": parsedArtist }
+
+2. API trả về JSON:
+   {
+     "matched": true,
+     "track": {
+       "title": "Tên bài hát chuẩn",
+       "artist": "Ca sĩ",
+       "album": "Album",
+       "durationMs": 240000,
+       "coverUrl": "https://...jpg",
+       "syncedLyrics": "[00:12.34] ...",
+       "plainLyrics": "..."
+     }
+   }
+
+3. Upload lên Cloudflare R2:
+   - Upload file .mp3 lên R2 (ví dụ key: tracks/<slug>-<timestamp>.mp3, Content-Type: audio/mpeg) -> lấy r2AudioUrl.
+   - Nếu track.coverUrl có dữ liệu: server/worker tải ảnh từ track.coverUrl rồi upload lên R2 (key: covers/<slug>-<timestamp>.jpg, Content-Type: image/jpeg) -> lấy r2CoverUrl.
+   - Lưu vào Database của App Nhạc: title, artist, album, durationMs, audioUrl: r2AudioUrl, coverUrl: r2CoverUrl, syncedLyrics, plainLyrics (lưu dạng text/LRC trong DB hoặc file .lrc trên R2).
+   - Ngoài ra, tạo thêm endpoint Webhook POST /api/webhooks/spotflow (xác thực header X-API-Key) để khi tôi xử lý file từ SpotFlow đẩy sang, App tự tải track.downloadUrl & track.coverUrl rồi lưu thẳng lên Cloudflare R2 tương tự.`;
 
   useEffect(() => {
     if (!isOpen) return;
@@ -118,15 +150,24 @@ export function IntegrationModal({
     }
   };
 
-  const copyToClipboard = async (text: string, type: 'key' | 'endpoint') => {
+  const copyToClipboard = async (
+    text: string,
+    type: 'key' | 'endpoint' | 'enrich' | 'prompt'
+  ) => {
     try {
       await navigator.clipboard.writeText(text);
       if (type === 'key') {
         setCopiedKey(true);
         setTimeout(() => setCopiedKey(false), 1500);
-      } else {
+      } else if (type === 'endpoint') {
         setCopiedEndpoint(true);
         setTimeout(() => setCopiedEndpoint(false), 1500);
+      } else if (type === 'enrich') {
+        setCopiedEnrichEndpoint(true);
+        setTimeout(() => setCopiedEnrichEndpoint(false), 1500);
+      } else {
+        setCopiedPrompt(true);
+        setTimeout(() => setCopiedPrompt(false), 1800);
       }
       showToast('Đã sao chép vào bộ nhớ tạm.');
     } catch {
@@ -210,6 +251,28 @@ export function IntegrationModal({
               </div>
 
               <div className="space-y-2">
+                <label className="block text-xs text-slate-400">
+                  API Tìm Ảnh Bìa &amp; Lyrics từ tên file MP3 (<code className="text-[#1DB954]">POST</code> cho luồng Upload R2)
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    readOnly
+                    value={enrichEndpointUrl}
+                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(enrichEndpointUrl, 'enrich')}
+                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                  >
+                    {copiedEnrichEndpoint ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
+                    <span>{copiedEnrichEndpoint ? 'Đã chép' : 'Sao chép'}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
                 <label className="block text-xs text-slate-400">API Key bảo mật (truyền qua Header <code className="text-[#1DB954]">X-API-Key</code>)</label>
                 <div className="flex items-center gap-2">
                   <input
@@ -228,6 +291,26 @@ export function IntegrationModal({
                   </button>
                 </div>
               </div>
+            </div>
+
+            {/* R2 Prompt Box */}
+            <div className="space-y-2.5 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954]">
+                  Lệnh / Prompt tạo tính năng lưu Ảnh + Lyrics lên Cloudflare R2 bên App Nhạc
+                </span>
+                <button
+                  type="button"
+                  onClick={() => copyToClipboard(r2PromptText, 'prompt')}
+                  className="px-3 py-1.5 rounded bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                >
+                  {copiedPrompt ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                  <span>{copiedPrompt ? 'Đã chép Prompt' : 'Sao chép Prompt'}</span>
+                </button>
+              </div>
+              <pre className="max-h-36 overflow-y-auto rounded bg-[#141920] border border-white/[0.08] p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">
+                {r2PromptText}
+              </pre>
             </div>
 
             {/* Step 2: Webhook URL & Auto Push */}

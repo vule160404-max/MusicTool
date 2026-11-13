@@ -1,28 +1,6 @@
-export interface SpotifyTrackItem {
-  id: string;
-  index: number;
-  title: string;
-  artist: string;
-  album: string;
-  durationMs: number;
-  spotifyUrl: string;
-  spotifyUri: string;
-  coverUrl: string;
-  previewUrl: string | null;
-  isExplicit: boolean;
-  syncedLyrics?: string | null;
-  plainLyrics?: string | null;
-}
+export type AudioBitrate = 320 | 256 | 192;
 
-export interface PresetChart {
-  id: string;
-  label: string;
-  region: string;
-  spotifyUrl: string;
-  description: string;
-}
-
-export type JobState = 'queued' | 'searching' | 'downloading' | 'converting' | 'done' | 'error';
+export type JobState = 'queued' | 'converting' | 'done' | 'error';
 
 export interface DownloadJob {
   jobId: string;
@@ -34,21 +12,47 @@ export interface DownloadJob {
   state: JobState;
   progress: number;
   message: string;
-  sourcePlatform: string | null;
-  matchedTitle: string | null;
   fileName: string | null;
   fileSizeBytes: number | null;
   error: string | null;
   createdAt?: number;
   updatedAt?: number;
+  coverUrl?: string | null;
+  durationMs?: number;
   syncedLyrics?: string | null;
   plainLyrics?: string | null;
 }
-
-export type AudioBitrate = 320 | 256 | 192;
 
 export interface IntegrationConfig {
   apiKey: string;
   webhookUrl: string;
   autoPushWebhook: boolean;
+}
+
+export interface EnrichedMetadata {
+  matched: boolean;
+  title: string;
+  artist: string;
+  album: string;
+  durationMs: number;
+  coverUrl: string;
+  syncedLyrics: string | null;
+  plainLyrics: string | null;
+}
+
+export interface LocalTrackEntry {
+  localId: string;
+  file: File;
+  fileName: string;
+  fileSizeBytes: number;
+  title: string;
+  artist: string;
+  album: string;
+  coverUrl: string;
+  durationMs: number;
+  syncedLyrics: string | null;
+  plainLyrics: string | null;
+  isEnriching: boolean;
+  enrichMatched: boolean;
+  job?: DownloadJob;
 }
