@@ -1,0 +1,6 @@
+{
+  "name": "SpotFlow MP3",
+  "description": "Công cụ lấy link hàng loạt bài hát hot từ Spotify và tự động tải về định dạng MP3 chất lượng cao 320kbps.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
