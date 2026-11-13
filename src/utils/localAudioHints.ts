@@ -144,7 +144,7 @@ function readAudioDurationSec(file: File): Promise<number | undefined> {
       resolve(val && Number.isFinite(val) && val > 0 ? Math.round(val) : undefined);
     };
 
-    const timer = setTimeout(() => finish(undefined), 1500);
+    const timer = setTimeout(() => finish(undefined), 800);
     audio.preload = 'metadata';
     audio.onloadedmetadata = () => finish(audio.duration);
     audio.onerror = () => finish(undefined);

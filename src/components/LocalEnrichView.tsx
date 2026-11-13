@@ -277,45 +277,91 @@ export function LocalEnrichView({
     entry: LocalTrackEntry,
     syncHistoryAfter = true
   ): Promise<DownloadJob | null> => {
+    const optimisticJob: DownloadJob = {
+      jobId: `pending_${entry.localId}`,
+      trackId: entry.localId,
+      title: entry.title,
+      artist: entry.artist,
+      album: entry.album,
+      bitrate,
+      state: 'converting',
+      progress: 45,
+      message: 'Đang gửi & gắn thẻ MP3...',
+      fileName: entry.fileName,
+      fileSizeBytes: entry.fileSizeBytes,
+      error: null,
+    };
+    setEntries((prev) =>
+      prev.map((e) => (e.localId === entry.localId ? { ...e, job: optimisticJob } : e))
+    );
+
     try {
-      const prepRes = await apiFetch('/api/local/prepare', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fileName: entry.fileName,
-          title: entry.title,
-          artist: entry.artist,
-          album: entry.album,
-          coverUrl: entry.coverUrl,
-          bitrate,
-          syncedLyrics: entry.syncedLyrics,
-          plainLyrics: entry.plainLyrics,
-        }),
+      const metaJson = JSON.stringify({
+        fileName: entry.fileName,
+        title: entry.title,
+        artist: entry.artist,
+        album: entry.album,
+        coverUrl: entry.coverUrl,
+        bitrate,
+        durationMs: entry.durationMs,
+        syncedLyrics: entry.syncedLyrics,
+        plainLyrics: entry.plainLyrics,
+        alreadyEnriched: !entry.isEnriching,
       });
-      const prepData = (await prepRes.json()) as { jobId?: string; job?: DownloadJob; error?: string };
-      if (!prepRes.ok || !prepData.jobId || !prepData.job) {
-        throw new Error(prepData.error || 'Không thể khởi tạo phiên xử lý');
-      }
+      const metaBytes = new TextEncoder().encode(metaJson);
+      const header = new Uint8Array(4);
+      new DataView(header.buffer).setUint32(0, metaBytes.length, false);
+      const bundleBlob = new Blob([header, metaBytes, entry.file]);
 
-      setEntries((prev) =>
-        prev.map((e) => (e.localId === entry.localId ? { ...e, job: prepData.job } : e))
-      );
-
-      const uploadRes = await apiFetch(`/api/local/upload/${encodeURIComponent(prepData.jobId)}`, {
+      const uploadRes = await apiFetch('/api/local/upload-direct?wait=1', {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/octet-stream',
-          'x-file-name': encodeURIComponent(entry.fileName),
+          'Content-Type': 'application/x-spotflow-bundle',
           'x-embed-tags': String(embedTags),
         },
-        body: entry.file,
+        body: bundleBlob,
       });
 
-      if (!uploadRes.ok) {
-        throw new Error('Lỗi khi gửi file lên máy chủ xử lý');
+      const uploadData = (await uploadRes.json()) as {
+        jobId?: string;
+        completed?: boolean;
+        job?: DownloadJob;
+        error?: string;
+      };
+      if (!uploadRes.ok || !uploadData.jobId || !uploadData.job) {
+        throw new Error(uploadData.error || 'Lỗi khi gửi file lên máy chủ xử lý');
       }
 
-      const finalJob = await pollJobUntilDone(entry.localId, prepData.jobId);
+      let finalJob: DownloadJob | null = null;
+      if (uploadData.completed) {
+        const completedJob: DownloadJob = uploadData.job;
+        finalJob = completedJob;
+        setEntries((prev) =>
+          prev.map((e) =>
+            e.localId === entry.localId
+              ? {
+                  ...e,
+                  job: completedJob,
+                  coverUrl: completedJob.coverUrl || e.coverUrl,
+                  durationMs: completedJob.durationMs || e.durationMs,
+                  syncedLyrics: completedJob.syncedLyrics ?? e.syncedLyrics,
+                  plainLyrics: completedJob.plainLyrics ?? e.plainLyrics,
+                }
+              : e
+          )
+        );
+        if (completedJob.state === 'done' && autoDownloadRef.current && !autoSavedRef.current.has(completedJob.jobId)) {
+          autoSavedRef.current.add(completedJob.jobId);
+          triggerSaveJobFile(completedJob);
+        }
+      } else {
+        const pendingJob: DownloadJob = uploadData.job;
+        setEntries((prev) =>
+          prev.map((e) => (e.localId === entry.localId ? { ...e, job: pendingJob } : e))
+        );
+        finalJob = await pollJobUntilDone(entry.localId, uploadData.jobId);
+      }
+
       if (finalJob) {
         onJobsUpdated([finalJob]);
         if (finalJob.state === 'done' && syncHistoryAfter) {
@@ -419,12 +465,25 @@ export function LocalEnrichView({
       entries.map((e) => normalizeTrackKey(e.title, e.artist)).filter(Boolean)
     );
 
+    const hintedFiles = new Array<{ file: File; hints: Awaited<ReturnType<typeof readLocalAudioHints>> }>(
+      validFiles.length
+    );
+    let hintCursor = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(8, validFiles.length) }).map(async () => {
+        while (hintCursor < validFiles.length) {
+          const idx = hintCursor++;
+          const file = validFiles[idx];
+          hintedFiles[idx] = { file, hints: await readLocalAudioHints(file) };
+        }
+      })
+    );
+
     const skippedList: SkippedDuplicateInfo[] = [];
     const acceptedItems: Array<{ entry: LocalTrackEntry; durationSec?: number }> = [];
 
-    for (const file of validFiles) {
+    for (const { file, hints } of hintedFiles) {
       const guessed = guessTitleArtistFromName(file.name);
-      const hints = await readLocalAudioHints(file);
       const title = hints.title || guessed.title;
       const artist = hints.artist || guessed.artist;
 
@@ -500,7 +559,8 @@ export function LocalEnrichView({
     setEntries((prev) => [...prev, ...acceptedItems.map((c) => c.entry)]);
 
     const queue = [...acceptedItems];
-    const workers = Array.from({ length: Math.min(4, queue.length) }).map(async () => {
+    const enrichWorkerCount = Math.min(6, queue.length);
+    const workers = Array.from({ length: enrichWorkerCount }).map(async () => {
       while (queue.length > 0) {
         const next = queue.shift();
         if (!next) break;
@@ -523,8 +583,9 @@ export function LocalEnrichView({
                 durationMs: enriched.durationMs || entry.durationMs,
                 syncedLyrics: enriched.syncedLyrics ?? entry.syncedLyrics,
                 plainLyrics: enriched.plainLyrics ?? entry.plainLyrics,
+                isEnriching: false,
               }
-            : entry;
+            : { ...entry, isEnriching: false };
           await processSingleEntry(mergedEntry, false);
         }
       }
@@ -543,7 +604,8 @@ export function LocalEnrichView({
     let doneCount = 0;
     try {
       const queue = [...targets];
-      const workers = Array.from({ length: Math.min(4, queue.length) }).map(async () => {
+      const processWorkers = Math.max(5, Math.min(8, (pushConcurrency || 4) + 2));
+      const workers = Array.from({ length: Math.min(processWorkers, queue.length) }).map(async () => {
         while (queue.length > 0) {
           const item = queue.shift();
           if (!item) break;

@@ -80,6 +80,7 @@ interface DownloadJob {
   r2CoverUrl?: string | null;
   r2CoverKey?: string | null;
   storageProvider?: 'spotflow' | 'r2';
+  alreadyEnriched?: boolean;
 }
 
 interface UploadHistoryItem {
@@ -580,29 +581,8 @@ function runProcessCapture(
   });
 }
 
-async function probeAudioDurationSec(filePath: string): Promise<number> {
-  try {
-    const res = await runProcessCapture(
-      FFPROBE_PATH,
-      [
-        '-v',
-        'error',
-        '-show_entries',
-        'format=duration',
-        '-of',
-        'default=noprint_wrappers=1:nokey=1',
-        filePath,
-      ],
-      10000
-    );
-    const val = parseFloat(res.stdout.trim());
-    return Number.isFinite(val) ? val : 0;
-  } catch {
-    return 0;
-  }
-}
-
-async function probeAudioEmbeddedTags(filePath: string): Promise<{
+async function probeAudioInfo(filePath: string): Promise<{
+  durationSec: number;
   title?: string;
   artist?: string;
   album?: string;
@@ -611,13 +591,15 @@ async function probeAudioEmbeddedTags(filePath: string): Promise<{
   try {
     const res = await runProcessCapture(
       FFPROBE_PATH,
-      ['-v', 'error', '-show_entries', 'format_tags', '-of', 'json', filePath],
-      10000
+      ['-v', 'error', '-show_entries', 'format=duration:format_tags', '-of', 'json', filePath],
+      8000
     );
-    if (res.code !== 0 || !res.stdout.trim()) return {};
+    if (res.code !== 0 || !res.stdout.trim()) return { durationSec: 0 };
     const parsed = JSON.parse(res.stdout) as {
-      format?: { tags?: Record<string, string> };
+      format?: { duration?: string | number; tags?: Record<string, string> };
     };
+    const durRaw = Number(parsed.format?.duration);
+    const durationSec = Number.isFinite(durRaw) && durRaw > 0 ? durRaw : 0;
     const tags = parsed.format?.tags || {};
     const lowerMap = new Map<string, string>();
     for (const [k, v] of Object.entries(tags)) {
@@ -633,21 +615,47 @@ async function probeAudioEmbeddedTags(filePath: string): Promise<{
       Array.from(lowerMap.entries()).find(([k]) => k.startsWith('lyrics'))?.[1];
 
     return {
+      durationSec,
       title: lowerMap.get('title'),
       artist: lowerMap.get('artist'),
       album: lowerMap.get('album'),
       lyrics: lyrics && lyrics.length > 20 ? lyrics : undefined,
     };
   } catch {
-    return {};
+    return { durationSec: 0 };
   }
 }
 
+const COVER_CACHE_TTL_MS = 30 * 60 * 1000;
+const coverBufferCache = new Map<string, { buf: Buffer; expiresAt: number }>();
+
+function isJpegBuffer(buf: Buffer): boolean {
+  return buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+}
+
 async function downloadFileBuffer(url: string): Promise<Buffer | null> {
+  const cleanUrl = url.trim();
+  if (!cleanUrl) return null;
+  const now = Date.now();
+  const cached = coverBufferCache.get(cleanUrl);
+  if (cached && cached.expiresAt > now) {
+    return cached.buf;
+  }
   try {
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const res = await fetch(cleanUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(8000),
+    });
     if (!res.ok) return null;
-    return Buffer.from(await res.arrayBuffer());
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > 500 && buf.length <= 5 * 1024 * 1024) {
+      if (coverBufferCache.size >= 80) {
+        const oldestKey = coverBufferCache.keys().next().value;
+        if (oldestKey) coverBufferCache.delete(oldestKey);
+      }
+      coverBufferCache.set(cleanUrl, { buf, expiresAt: now + COVER_CACHE_TTL_MS });
+    }
+    return buf;
   } catch {
     return null;
   }
@@ -667,59 +675,66 @@ async function searchTrackCoverAndMeta(
   const query = `${artist} ${cleanTitle}`.replace(/\s+/g, ' ').trim();
   if (!query) return null;
 
-  const countries = ['vn', 'us'];
+  const countries = ['vn', 'us'] as const;
+  const normTarget = normalizeForMatch(query);
+  const targetTokens = normTarget.split(' ').filter((w) => w.length >= 2);
+  const normCleanTitle = normalizeForMatch(cleanTitle);
+  const normPrimaryArtist = artist ? normalizeForMatch(artist.split(',')[0]) : '';
+
+  const countryLists = await Promise.all(
+    countries.map(async (country) => {
+      try {
+        const url = `https://itunes.apple.com/search?media=music&entity=song&limit=6&country=${country}&term=${encodeURIComponent(
+          query
+        )}`;
+        const res = await fetch(url, {
+          headers: { 'User-Agent': 'SpotFlow-MP3/1.0' },
+          signal: AbortSignal.timeout(3500),
+        });
+        if (!res.ok) return [] as ItunesSearchResult[];
+        const data = (await res.json()) as { results?: ItunesSearchResult[] };
+        return data.results || [];
+      } catch {
+        return [] as ItunesSearchResult[];
+      }
+    })
+  );
+
   let bestMatch: ItunesSearchResult | null = null;
   let bestScore = -999;
 
-  for (const country of countries) {
-    try {
-      const url = `https://itunes.apple.com/search?media=music&entity=song&limit=6&country=${country}&term=${encodeURIComponent(
-        query
-      )}`;
-      const res = await fetch(url, { headers: { 'User-Agent': 'SpotFlow-MP3/1.0' } });
-      if (!res.ok) continue;
-      const data = (await res.json()) as { results?: ItunesSearchResult[] };
-      const results = data.results || [];
-      if (results.length === 0) continue;
+  for (const results of countryLists) {
+    for (const item of results) {
+      const itemTitle = item.trackName || '';
+      const itemArtist = item.artistName || '';
+      const normItemTitle = normalizeForMatch(itemTitle);
+      const normItem = normalizeForMatch(`${itemTitle} ${itemArtist}`);
 
-      const normTarget = normalizeForMatch(query);
-      const targetTokens = normTarget.split(' ').filter((w) => w.length >= 2);
-
-      for (const item of results) {
-        const itemTitle = item.trackName || '';
-        const itemArtist = item.artistName || '';
-        const normItem = normalizeForMatch(`${itemTitle} ${itemArtist}`);
-
-        let score = 0;
-        if (targetTokens.length > 0) {
-          let hits = 0;
-          for (const tok of targetTokens) {
-            if (normItem.includes(tok)) hits++;
-          }
-          score += Math.round((hits / targetTokens.length) * 80);
+      let score = 0;
+      if (targetTokens.length > 0) {
+        let hits = 0;
+        for (const tok of targetTokens) {
+          if (normItem.includes(tok)) hits++;
         }
-        if (normalizeForMatch(itemTitle) === normalizeForMatch(cleanTitle)) {
-          score += 30;
-        }
-        if (artist && normalizeForMatch(itemArtist).includes(normalizeForMatch(artist.split(',')[0]))) {
-          score += 20;
-        }
-        const penaltyWords = ['karaoke', 'instrumental', 'tribute', 'cover', '8-bit'];
-        for (const pw of penaltyWords) {
-          if (normalizeForMatch(itemTitle).includes(pw) && !normTarget.includes(pw)) {
-            score -= 50;
-          }
-        }
-
-        if (score > bestScore) {
-          bestScore = score;
-          bestMatch = item;
+        score += Math.round((hits / targetTokens.length) * 80);
+      }
+      if (normItemTitle === normCleanTitle) {
+        score += 30;
+      }
+      if (normPrimaryArtist && normalizeForMatch(itemArtist).includes(normPrimaryArtist)) {
+        score += 20;
+      }
+      const penaltyWords = ['karaoke', 'instrumental', 'tribute', 'cover', '8-bit'];
+      for (const pw of penaltyWords) {
+        if (normItemTitle.includes(pw) && !normTarget.includes(pw)) {
+          score -= 50;
         }
       }
 
-      if (bestMatch && bestScore >= 70) break;
-    } catch {
-      // Try next region
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = item;
+      }
     }
   }
 
@@ -842,7 +857,7 @@ async function fetchLrclibJson(url: string): Promise<LrclibItem[]> {
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'SpotFlow-MP3/1.0 (contact@spotflow.app)' },
-      signal: AbortSignal.timeout(4500),
+      signal: AbortSignal.timeout(3200),
     });
     if (!res.ok) return [];
     const data = (await res.json()) as LrclibItem | LrclibItem[];
@@ -875,7 +890,8 @@ async function searchLrclibLyrics(
     }
   };
 
-  // 1. Exact /api/get when artist & title are available
+  // Phase 1: fire exact /api/get + primary structured /api/search requests concurrently
+  const phase1Urls: string[] = [];
   if (primaryArtist) {
     const params = new URLSearchParams({
       track_name: primaryTitle,
@@ -883,40 +899,35 @@ async function searchLrclibLyrics(
     });
     if (albumName) params.set('album_name', albumName);
     if (durationSec && durationSec > 0) params.set('duration', String(Math.round(durationSec)));
-    evaluate(await fetchLrclibJson(`https://lrclib.net/api/get?${params.toString()}`));
-    if (bestItem && bestScore >= 90 && (bestItem as LrclibItem).syncedLyrics) {
-      return {
-        syncedLyrics: (bestItem as LrclibItem).syncedLyrics || null,
-        plainLyrics: (bestItem as LrclibItem).plainLyrics || null,
-        score: bestScore,
-      };
-    }
+    phase1Urls.push(`https://lrclib.net/api/get?${params.toString()}`);
   }
 
-  // 2. Structured search across top title/artist pairs
-  const pairs: Array<[string, string]> = [];
+  const seenPairs = new Set<string>();
   for (const t of titleCandidates.slice(0, 2)) {
-    for (const a of artistCandidates.slice(0, 2)) {
-      pairs.push([t, a]);
-    }
-  }
-  if (pairs.length === 0) pairs.push([primaryTitle, '']);
-
-  for (const [t, a] of pairs) {
-    const url = a
-      ? `https://lrclib.net/api/search?track_name=${encodeURIComponent(t)}&artist_name=${encodeURIComponent(a)}`
-      : `https://lrclib.net/api/search?track_name=${encodeURIComponent(t)}`;
-    evaluate(await fetchLrclibJson(url));
-    if (bestItem && bestScore >= 85 && (bestItem as LrclibItem).syncedLyrics) {
-      return {
-        syncedLyrics: (bestItem as LrclibItem).syncedLyrics || null,
-        plainLyrics: (bestItem as LrclibItem).plainLyrics || null,
-        score: bestScore,
-      };
+    for (const a of (artistCandidates.length > 0 ? artistCandidates.slice(0, 2) : [''])) {
+      const key = `${t}|${a}`;
+      if (seenPairs.has(key) || phase1Urls.length >= 4) continue;
+      seenPairs.add(key);
+      phase1Urls.push(
+        a
+          ? `https://lrclib.net/api/search?track_name=${encodeURIComponent(t)}&artist_name=${encodeURIComponent(a)}`
+          : `https://lrclib.net/api/search?track_name=${encodeURIComponent(t)}`
+      );
     }
   }
 
-  // 3. Combined q search (normal + diacritics stripped)
+  const phase1Batches = await Promise.all(phase1Urls.map((u) => fetchLrclibJson(u)));
+  for (const batch of phase1Batches) evaluate(batch);
+
+  if (bestItem && bestScore >= 85 && (bestItem as LrclibItem).syncedLyrics) {
+    return {
+      syncedLyrics: (bestItem as LrclibItem).syncedLyrics || null,
+      plainLyrics: (bestItem as LrclibItem).plainLyrics || null,
+      score: bestScore,
+    };
+  }
+
+  // Phase 2: concurrent q fallback (normal + diacritics-stripped)
   const qQueries = new Set<string>();
   if (primaryArtist) qQueries.add(`${primaryTitle} ${primaryArtist}`);
   qQueries.add(primaryTitle);
@@ -926,12 +937,12 @@ async function searchLrclibLyrics(
     qQueries.add(`${asciiTitle} ${asciiArtist}`.trim());
   }
 
-  for (const q of qQueries) {
-    evaluate(await fetchLrclibJson(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`));
-    if (bestItem && bestScore >= 85 && (bestItem as LrclibItem).syncedLyrics) {
-      break;
-    }
-  }
+  const phase2Batches = await Promise.all(
+    Array.from(qQueries)
+      .slice(0, 3)
+      .map((q) => fetchLrclibJson(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`))
+  );
+  for (const batch of phase2Batches) evaluate(batch);
 
   const minThreshold = artistCandidates.length > 0 ? 50 : 60;
   if (!bestItem || bestScore < minThreshold) return null;
@@ -959,7 +970,7 @@ async function searchNeteaseLyrics(
     const q = `${title} ${artist}`.trim();
     const searchRes = await fetch(
       `https://music.xianqiao.wang/neteaseapiv2/search?keywords=${encodeURIComponent(q)}&limit=5`,
-      { signal: AbortSignal.timeout(4500) }
+      { signal: AbortSignal.timeout(3200) }
     );
     if (!searchRes.ok) return null;
     const searchData = (await searchRes.json()) as {
@@ -1024,14 +1035,13 @@ async function searchNeteaseLyrics(
 
     const lrcRes = await fetch(
       `https://music.xianqiao.wang/neteaseapiv2/lyric?id=${bestSongId}`,
-      { signal: AbortSignal.timeout(4500) }
+      { signal: AbortSignal.timeout(3200) }
     );
     if (!lrcRes.ok) return null;
     const lrcData = (await lrcRes.json()) as { lrc?: { lyric?: string } };
     const rawLrc = lrcData.lrc?.lyric?.trim();
     if (!rawLrc || rawLrc.length < 30) return null;
 
-    // Filter out instrumental-only notices
     if (/纯音乐.*请欣赏/i.test(rawLrc) && rawLrc.split('\n').length < 4) return null;
 
     const isSynced = /\[\d{1,2}:\d{2}/.test(rawLrc);
@@ -1061,15 +1071,21 @@ async function searchLyricsOvh(
 
   const titlesToTry = titleCandidates.slice(0, 2);
   const artistsToTry = artistCandidates.slice(0, 2);
-
+  const pairs: Array<[string, string]> = [];
   for (const artist of artistsToTry) {
     for (const title of titlesToTry) {
+      pairs.push([artist, title]);
+    }
+  }
+
+  const attempts = await Promise.all(
+    pairs.map(async ([artist, title]) => {
       try {
         const res = await fetch(
           `https://api.lyrics.ovh/v1/${encodeURIComponent(artist)}/${encodeURIComponent(title)}`,
-          { signal: AbortSignal.timeout(3500) }
+          { signal: AbortSignal.timeout(2500) }
         );
-        if (!res.ok) continue;
+        if (!res.ok) return null;
         const data = (await res.json()) as { lyrics?: string };
         const text = data.lyrics
           ?.replace(/^Paroles de la chanson .+?\r?\n/i, '')
@@ -1079,12 +1095,14 @@ async function searchLyricsOvh(
         if (text && text.length > 25) {
           return { syncedLyrics: null, plainLyrics: text };
         }
+        return null;
       } catch {
-        // Try next candidate
+        return null;
       }
-    }
-  }
-  return null;
+    })
+  );
+
+  return attempts.find((a) => a !== null) || null;
 }
 
 async function fetchLyrics(
@@ -1099,14 +1117,12 @@ async function fetchLyrics(
     return { syncedLyrics: null, plainLyrics: null };
   }
 
-  // 1. Primary: LRCLIB with strict scoring & multi-variant query cascade
-  const lrcResult = await searchLrclibLyrics(
-    titleCandidates,
-    artistCandidates,
-    albumName,
-    durationSec
-  );
-  if (lrcResult?.syncedLyrics) {
+  // Kick off LRCLIB & NetEase in parallel instead of serially
+  const lrcPromise = searchLrclibLyrics(titleCandidates, artistCandidates, albumName, durationSec);
+  const neteasePromise = searchNeteaseLyrics(titleCandidates, artistCandidates, durationSec);
+
+  const lrcResult = await lrcPromise;
+  if (lrcResult?.syncedLyrics && lrcResult.score >= 85) {
     return {
       syncedLyrics: lrcResult.syncedLyrics,
       plainLyrics: lrcResult.plainLyrics,
@@ -1114,13 +1130,18 @@ async function fetchLyrics(
     };
   }
 
-  // 2. Fallback: NetEase Cloud Music (great coverage + synced LRC for V-Pop / Asian / Indie)
-  const neteaseResult = await searchNeteaseLyrics(titleCandidates, artistCandidates, durationSec);
+  const neteaseResult = await neteasePromise;
+  if (lrcResult?.syncedLyrics) {
+    return {
+      syncedLyrics: lrcResult.syncedLyrics,
+      plainLyrics: lrcResult.plainLyrics,
+      source: 'lrclib',
+    };
+  }
   if (neteaseResult?.syncedLyrics) {
     return { ...neteaseResult, source: 'netease' };
   }
 
-  // If LRCLIB had plainLyrics, prefer it or NetEase plainLyrics
   if (lrcResult?.plainLyrics) {
     return {
       syncedLyrics: null,
@@ -1132,7 +1153,7 @@ async function fetchLyrics(
     return { ...neteaseResult, source: 'netease-plain' };
   }
 
-  // 3. Fallback: lyrics.ovh
+  // Fallback: lyrics.ovh (parallelized)
   const ovhResult = await searchLyricsOvh(titleCandidates, artistCandidates);
   if (ovhResult) {
     return { ...ovhResult, source: 'lyrics.ovh' };
@@ -1140,6 +1161,24 @@ async function fetchLyrics(
 
   return { syncedLyrics: null, plainLyrics: null };
 }
+
+interface EnrichCacheEntry {
+  expiresAt: number;
+  value: {
+    matched: boolean;
+    title: string;
+    artist: string;
+    album: string;
+    durationMs: number;
+    coverUrl: string;
+    syncedLyrics: string | null;
+    plainLyrics: string | null;
+    lyricsSource?: string;
+  };
+}
+
+const ENRICH_CACHE_TTL_MS = 30 * 60 * 1000;
+const enrichCache = new Map<string, EnrichCacheEntry>();
 
 async function enrichTrackMetadata(input: {
   fileName?: string;
@@ -1162,7 +1201,27 @@ async function enrichTrackMetadata(input: {
   const initialTitle = (input.title || parsed.title || '').trim();
   const initialArtist = (input.artist || parsed.artist || '').trim();
 
-  let meta = await searchTrackCoverAndMeta(initialTitle, initialArtist);
+  const durBucket = input.durationSec ? Math.round(input.durationSec / 5) : 0;
+  const cacheKey = `${normalizeForMatch(initialTitle)}|${normalizeForMatch(initialArtist)}|${durBucket}`;
+  const now = Date.now();
+  if (cacheKey !== '||0') {
+    const cached = enrichCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+  }
+
+  // Start iTunes cover/meta search & initial lyrics search concurrently in parallel
+  const coverPromise = searchTrackCoverAndMeta(initialTitle, initialArtist);
+  const initialLyricsPromise = initialTitle
+    ? fetchLyrics(initialTitle, initialArtist, input.durationSec, input.album)
+    : Promise.resolve({ syncedLyrics: null, plainLyrics: null } as {
+        syncedLyrics: string | null;
+        plainLyrics: string | null;
+        source?: string;
+      });
+
+  let [meta, finalLyrics] = await Promise.all([coverPromise, initialLyricsPromise]);
 
   if (!meta && initialArtist && initialTitle) {
     meta = await searchTrackCoverAndMeta(initialArtist, initialTitle);
@@ -1178,28 +1237,25 @@ async function enrichTrackMetadata(input: {
       ? Math.round(meta.durationMs / 1000)
       : undefined;
 
-  const lyrics = await fetchLyrics(
-    resolvedTitle,
-    resolvedArtist,
-    resolvedDurationSec,
-    resolvedAlbum
-  );
-
-  // If iTunes adjusted the title/artist (e.g. translated or added OST tag) and lyrics missed, retry with initial raw title/artist!
-  let finalLyrics = lyrics;
+  // Retry lyrics only if initial search missed AND iTunes resolved a meaningfully different title/artist
   if (
     !finalLyrics.syncedLyrics &&
     !finalLyrics.plainLyrics &&
-    initialTitle &&
-    normalizeForMatch(initialTitle) !== normalizeForMatch(resolvedTitle)
+    (normalizeForMatch(resolvedTitle) !== normalizeForMatch(initialTitle) ||
+      normalizeForMatch(resolvedArtist) !== normalizeForMatch(initialArtist))
   ) {
-    const retryLyrics = await fetchLyrics(initialTitle, initialArtist || resolvedArtist, resolvedDurationSec);
+    const retryLyrics = await fetchLyrics(
+      resolvedTitle,
+      resolvedArtist,
+      resolvedDurationSec,
+      resolvedAlbum
+    );
     if (retryLyrics.syncedLyrics || retryLyrics.plainLyrics) {
       finalLyrics = retryLyrics;
     }
   }
 
-  return {
+  const result = {
     matched: Boolean(meta?.coverUrl || finalLyrics.syncedLyrics || finalLyrics.plainLyrics),
     title: resolvedTitle,
     artist: resolvedArtist,
@@ -1210,6 +1266,16 @@ async function enrichTrackMetadata(input: {
     plainLyrics: finalLyrics.plainLyrics,
     lyricsSource: finalLyrics.source,
   };
+
+  if (cacheKey !== '||0') {
+    if (enrichCache.size >= 400) {
+      const oldestKey = enrichCache.keys().next().value;
+      if (oldestKey) enrichCache.delete(oldestKey);
+    }
+    enrichCache.set(cacheKey, { expiresAt: now + ENRICH_CACHE_TTL_MS, value: result });
+  }
+
+  return result;
 }
 
 function slugifyR2Segment(input: string): string {
@@ -1436,113 +1502,126 @@ async function processLocalUploadJob(
 
   try {
     await ensureWorkspace();
-    await fsp.writeFile(rawInputPath, rawBuffer);
-    tempFiles.push(rawInputPath);
 
     job.state = 'converting';
     job.progress = 45;
     job.message = 'Đang tải ảnh bìa & nhúng ID3/Lyrics...';
     job.updatedAt = Date.now();
 
-    // Download cover art concurrently with audio probing whenever coverUrl is already known
-    const prefetchedCoverPromise: Promise<Buffer | null> | null =
-      embedTags && job.coverUrl ? downloadFileBuffer(job.coverUrl) : null;
-
-    const probedSec = await probeAudioDurationSec(rawInputPath);
-    if (probedSec > 0) {
-      job.durationMs = Math.round(probedSec * 1000);
-    }
-
-    if (!job.syncedLyrics && !job.plainLyrics) {
-      const embedded = await probeAudioEmbeddedTags(rawInputPath);
-      if (embedded.lyrics) {
-        const isLrc = /\[\d{1,2}:\d{2}/.test(embedded.lyrics);
-        if (isLrc) job.syncedLyrics = embedded.lyrics;
-        job.plainLyrics = isLrc ? lrcToPlainText(embedded.lyrics) : embedded.lyrics;
-      }
-      if ((!job.title || job.title === 'Unknown Track') && embedded.title) {
-        job.title = embedded.title;
-      }
-      if ((!job.artist || job.artist === 'Unknown Artist') && embedded.artist) {
-        job.artist = embedded.artist;
-      }
-    }
-
-    if (!job.coverUrl || (!job.syncedLyrics && !job.plainLyrics)) {
-      const enriched = await enrichTrackMetadata({
-        title: job.title,
-        artist: job.artist,
-        album: job.album,
-        durationSec: probedSec > 0 ? Math.round(probedSec) : undefined,
-      });
-      if (!job.coverUrl && enriched.coverUrl) job.coverUrl = enriched.coverUrl;
-      if (!job.album && enriched.album) job.album = enriched.album;
-      if (!job.syncedLyrics && enriched.syncedLyrics) job.syncedLyrics = enriched.syncedLyrics;
-      if (!job.plainLyrics && enriched.plainLyrics) job.plainLyrics = enriched.plainLyrics;
-    }
-
-    let coverFilePath: string | null = null;
-    if (embedTags && job.coverUrl) {
-      const coverBuf = prefetchedCoverPromise
-        ? await prefetchedCoverPromise
-        : await downloadFileBuffer(job.coverUrl);
-      if (coverBuf && coverBuf.length > 500) {
-        coverFilePath = path.join(WORKSPACE_DIR, `${job.jobId}_cover.jpg`);
-        await fsp.writeFile(coverFilePath, coverBuf);
-        tempFiles.push(coverFilePath);
-      }
-    }
-
-    const ffmpegArgs: string[] = ['-y', '-i', rawInputPath];
-    if (coverFilePath) {
-      ffmpegArgs.push('-i', coverFilePath, '-map', '0:a', '-map', '1:0');
+    // Ultra-fast bypass: raw MP3 with embedTags disabled needs no FFmpeg spawn at all
+    if (safeExt === 'mp3' && !embedTags) {
+      await fsp.writeFile(finalMp3Path, rawBuffer);
+      job.filePath = finalMp3Path;
+      job.fileName = `${finalBaseName}.mp3`;
+      job.fileSizeBytes = rawBuffer.length;
     } else {
-      ffmpegArgs.push('-map', '0:a');
-    }
+      await fsp.writeFile(rawInputPath, rawBuffer);
+      tempFiles.push(rawInputPath);
 
-    if (safeExt === 'mp3') {
-      ffmpegArgs.push('-c:a', 'copy');
-    } else {
-      ffmpegArgs.push('-codec:a', 'libmp3lame', '-b:a', `${job.bitrate}k`, '-ar', '44100');
-    }
+      const prefetchedCoverPromise: Promise<Buffer | null> | null =
+        embedTags && job.coverUrl ? downloadFileBuffer(job.coverUrl) : null;
 
-    ffmpegArgs.push('-id3v2_version', '3');
+      const hasKnownDuration = Boolean(job.durationMs && job.durationMs > 0);
+      const hasKnownLyrics = Boolean(job.syncedLyrics || job.plainLyrics);
+      const needsProbe = !hasKnownDuration || (!hasKnownLyrics && !job.alreadyEnriched);
 
-    if (embedTags) {
-      ffmpegArgs.push(
-        '-metadata',
-        `title=${job.title}`,
-        '-metadata',
-        `artist=${job.artist}`,
-        '-metadata',
-        `album=${job.album || 'SpotFlow Upload'}`
-      );
-      if (job.plainLyrics || job.syncedLyrics) {
-        ffmpegArgs.push('-metadata', `lyrics=${job.plainLyrics || job.syncedLyrics}`);
+      const probed = needsProbe ? await probeAudioInfo(rawInputPath) : { durationSec: 0 };
+      if (probed.durationSec > 0 && !hasKnownDuration) {
+        job.durationMs = Math.round(probed.durationSec * 1000);
       }
+
+      if (!hasKnownLyrics && probed.lyrics) {
+        const isLrc = /\[\d{1,2}:\d{2}/.test(probed.lyrics);
+        if (isLrc) job.syncedLyrics = probed.lyrics;
+        job.plainLyrics = isLrc ? lrcToPlainText(probed.lyrics) : probed.lyrics;
+      }
+      if ((!job.title || job.title === 'Unknown Track') && probed.title) {
+        job.title = probed.title;
+      }
+      if ((!job.artist || job.artist === 'Unknown Artist') && probed.artist) {
+        job.artist = probed.artist;
+      }
+
+      // Skip duplicate external API enrichment when browser already ran enrich for this track
+      if (!job.alreadyEnriched && (!job.coverUrl || (!job.syncedLyrics && !job.plainLyrics))) {
+        const probedDurSec = job.durationMs && job.durationMs > 0 ? Math.round(job.durationMs / 1000) : undefined;
+        const enriched = await enrichTrackMetadata({
+          title: job.title,
+          artist: job.artist,
+          album: job.album,
+          durationSec: probedDurSec,
+        });
+        if (!job.coverUrl && enriched.coverUrl) job.coverUrl = enriched.coverUrl;
+        if (!job.album && enriched.album) job.album = enriched.album;
+        if (!job.syncedLyrics && enriched.syncedLyrics) job.syncedLyrics = enriched.syncedLyrics;
+        if (!job.plainLyrics && enriched.plainLyrics) job.plainLyrics = enriched.plainLyrics;
+      }
+
+      let coverFilePath: string | null = null;
+      let coverIsJpeg = false;
+      if (embedTags && job.coverUrl) {
+        const coverBuf = prefetchedCoverPromise
+          ? await prefetchedCoverPromise
+          : await downloadFileBuffer(job.coverUrl);
+        if (coverBuf && coverBuf.length > 500) {
+          coverIsJpeg = isJpegBuffer(coverBuf);
+          coverFilePath = path.join(WORKSPACE_DIR, `${job.jobId}_cover.${coverIsJpeg ? 'jpg' : 'img'}`);
+          await fsp.writeFile(coverFilePath, coverBuf);
+          tempFiles.push(coverFilePath);
+        }
+      }
+
+      const ffmpegArgs: string[] = ['-y', '-loglevel', 'error', '-i', rawInputPath];
       if (coverFilePath) {
-        ffmpegArgs.push(
-          '-c:v',
-          'mjpeg',
-          '-metadata:s:v',
-          'title=Album cover',
-          '-metadata:s:v',
-          'comment=Cover (front)'
-        );
+        ffmpegArgs.push('-i', coverFilePath, '-map', '0:a', '-map', '1:0');
+      } else {
+        ffmpegArgs.push('-map', '0:a');
       }
+
+      if (safeExt === 'mp3') {
+        ffmpegArgs.push('-c:a', 'copy');
+      } else {
+        ffmpegArgs.push('-codec:a', 'libmp3lame', '-b:a', `${job.bitrate}k`, '-ar', '44100');
+      }
+
+      ffmpegArgs.push('-id3v2_version', '3');
+
+      if (embedTags) {
+        ffmpegArgs.push(
+          '-metadata',
+          `title=${job.title}`,
+          '-metadata',
+          `artist=${job.artist}`,
+          '-metadata',
+          `album=${job.album || 'SpotFlow Upload'}`
+        );
+        if (job.plainLyrics || job.syncedLyrics) {
+          ffmpegArgs.push('-metadata', `lyrics=${job.plainLyrics || job.syncedLyrics}`);
+        }
+        if (coverFilePath) {
+          ffmpegArgs.push(
+            '-c:v',
+            coverIsJpeg ? 'copy' : 'mjpeg',
+            '-metadata:s:v',
+            'title=Album cover',
+            '-metadata:s:v',
+            'comment=Cover (front)'
+          );
+        }
+      }
+
+      ffmpegArgs.push(finalMp3Path);
+
+      const ffRes = await runProcessCapture(FFMPEG_PATH, ffmpegArgs, 90000);
+      if (ffRes.code !== 0 || !fs.existsSync(finalMp3Path)) {
+        throw new Error('Không thể xử lý file âm thanh bằng FFmpeg.');
+      }
+
+      const stat = await fsp.stat(finalMp3Path);
+      job.filePath = finalMp3Path;
+      job.fileName = `${finalBaseName}.mp3`;
+      job.fileSizeBytes = stat.size;
     }
-
-    ffmpegArgs.push(finalMp3Path);
-
-    const ffRes = await runProcessCapture(FFMPEG_PATH, ffmpegArgs, 90000);
-    if (ffRes.code !== 0 || !fs.existsSync(finalMp3Path)) {
-      throw new Error('Không thể xử lý file âm thanh bằng FFmpeg.');
-    }
-
-    const stat = await fsp.stat(finalMp3Path);
-    job.filePath = finalMp3Path;
-    job.fileName = `${finalBaseName}.mp3`;
-    job.fileSizeBytes = stat.size;
 
     if (integrationSettings.autoPushWebhook && integrationSettings.webhookUrl) {
       job.progress = 92;
@@ -2076,6 +2155,125 @@ async function startServer() {
       jobs: updatedJobs,
     });
   });
+
+  app.post(
+    '/api/local/upload-direct',
+    express.raw({ type: '*/*', limit: '120mb' }),
+    async (req: Request, res: Response) => {
+      const buf = req.body;
+      if (!Buffer.isBuffer(buf) || buf.length === 0) {
+        res.status(400).json({ error: 'File tải lên bị rỗng hoặc không hợp lệ.' });
+        return;
+      }
+
+      let meta: {
+        fileName?: string;
+        title?: string;
+        artist?: string;
+        album?: string;
+        coverUrl?: string;
+        bitrate?: number;
+        durationMs?: number;
+        syncedLyrics?: string | null;
+        plainLyrics?: string | null;
+        alreadyEnriched?: boolean;
+      } = {};
+      let audioBuf: Buffer = buf;
+
+      const contentType = String(req.headers['content-type'] || '').toLowerCase();
+      if (contentType.includes('application/x-spotflow-bundle')) {
+        if (buf.length < 8) {
+          res.status(400).json({ error: 'Gói dữ liệu upload không hợp lệ.' });
+          return;
+        }
+        const metaLen = buf.readUInt32BE(0);
+        if (metaLen > 1024 * 1024 || 4 + metaLen >= buf.length) {
+          res.status(400).json({ error: 'Metadata upload quá lớn hoặc bị hỏng.' });
+          return;
+        }
+        try {
+          meta = JSON.parse(buf.subarray(4, 4 + metaLen).toString('utf8')) as typeof meta;
+          audioBuf = buf.subarray(4 + metaLen);
+        } catch {
+          res.status(400).json({ error: 'Không thể đọc metadata bài hát.' });
+          return;
+        }
+      } else {
+        const rawMetaHeader = req.headers['x-track-meta'];
+        if (typeof rawMetaHeader === 'string' && rawMetaHeader.trim()) {
+          try {
+            meta = JSON.parse(decodeURIComponent(rawMetaHeader)) as typeof meta;
+          } catch {
+            // Fallback to header fileName
+          }
+        }
+      }
+
+      const rawName =
+        meta.fileName ||
+        (req.headers['x-file-name']
+          ? decodeURIComponent(String(req.headers['x-file-name']))
+          : 'audio.mp3');
+      const parsed = rawName ? parseTrackFilename(rawName) : { title: '', artist: '' };
+      const bitrate = [192, 256, 320].includes(Number(meta.bitrate)) ? Number(meta.bitrate) : 320;
+      const jobId = crypto.randomBytes(8).toString('hex');
+      const trackId = `local_${crypto.randomBytes(6).toString('hex')}`;
+      const extMatch = rawName.match(/\.([a-zA-Z0-9]{2,5})$/);
+      const ext = extMatch ? extMatch[1].toLowerCase() : 'mp3';
+      const embedTags = String(req.headers['x-embed-tags'] || 'true') !== 'false';
+      const reqHost = req.get('host') || 'localhost:3000';
+      const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+
+      const job: DownloadJob = {
+        jobId,
+        trackId,
+        title: (meta.title || parsed.title || 'Unknown Track').trim(),
+        artist: (meta.artist || parsed.artist || 'Unknown Artist').trim(),
+        album: (meta.album || 'Local Upload').trim(),
+        bitrate,
+        state: 'converting',
+        progress: 30,
+        message: 'Đã nhận file, đang gắn ảnh bìa & lyrics...',
+        filePath: null,
+        fileName: rawName || null,
+        sourceFileName: rawName || null,
+        fileSizeBytes: null,
+        error: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        syncedLyrics: meta.syncedLyrics ?? null,
+        plainLyrics: meta.plainLyrics ?? null,
+        coverUrl: meta.coverUrl?.trim() || null,
+        durationMs: Number(meta.durationMs) > 0 ? Number(meta.durationMs) : 0,
+        alreadyEnriched: Boolean(meta.alreadyEnriched),
+        webhookStatus: 'idle',
+        webhookMessage: null,
+        pushedAt: null,
+      };
+
+      jobs.set(jobId, job);
+
+      const processingPromise = processLocalUploadJob(job, audioBuf, ext, embedTags, reqHost, reqProtocol);
+      const shouldWait = req.query.wait === '1' || req.query.wait === 'true';
+
+      if (shouldWait) {
+        await Promise.race([
+          processingPromise.catch(() => {}),
+          new Promise<void>((resolve) => setTimeout(resolve, 25000)),
+        ]);
+        const completed = job.state === 'done' || job.state === 'error';
+        res.json({
+          jobId,
+          completed,
+          job: { ...job, filePath: null },
+        });
+        return;
+      }
+
+      processingPromise.catch(() => {});
+      res.json({ jobId, completed: false, job: { ...job, filePath: null } });
+    }
+  );
 
   app.post(
     '/api/local/upload/:jobId',
