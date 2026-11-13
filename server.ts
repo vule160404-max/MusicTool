@@ -158,9 +158,12 @@ const ENV_HAS_ALL_R2 = Boolean(
 );
 const ENV_R2_ENABLED_RAW = (process.env.R2_ENABLED || '').trim().toLowerCase();
 
+const ENV_SPOTFLOW_API_KEY = readFirstEnv('SPOTFLOW_API_KEY', 'WEBHOOK_API_KEY', 'SPOTFLOW_X_API_KEY');
+const ENV_WEBHOOK_URL = readFirstEnv('SPOTFLOW_WEBHOOK_URL', 'WEBHOOK_URL');
+
 const integrationSettings: IntegrationSettings = {
-  apiKey: `sf_live_${crypto.randomBytes(16).toString('hex')}`,
-  webhookUrl: '',
+  apiKey: ENV_SPOTFLOW_API_KEY || `sf_live_${crypto.randomBytes(16).toString('hex')}`,
+  webhookUrl: ENV_WEBHOOK_URL,
   autoPushWebhook: false,
   pushConcurrency: 4,
   r2: {
@@ -260,7 +263,7 @@ async function loadIntegrationSettings(): Promise<void> {
     if (typeof parsed.apiKey === 'string' && parsed.apiKey.trim()) {
       integrationSettings.apiKey = parsed.apiKey.trim();
     }
-    if (typeof parsed.webhookUrl === 'string') {
+    if (typeof parsed.webhookUrl === 'string' && (parsed.webhookUrl.trim() || !ENV_WEBHOOK_URL)) {
       integrationSettings.webhookUrl = parsed.webhookUrl.trim();
     }
     if (typeof parsed.autoPushWebhook === 'boolean') {
@@ -1662,6 +1665,7 @@ async function startServer() {
 
   app.post('/api/integration/settings', async (req: Request, res: Response) => {
     const body = req.body as {
+      apiKey?: string;
       webhookUrl?: string;
       autoPushWebhook?: boolean;
       pushConcurrency?: number;
@@ -1687,6 +1691,8 @@ async function startServer() {
     }
     if (body.regenerateKey) {
       integrationSettings.apiKey = `sf_live_${crypto.randomBytes(16).toString('hex')}`;
+    } else if (typeof body.apiKey === 'string' && body.apiKey.trim()) {
+      integrationSettings.apiKey = body.apiKey.trim();
     }
     if (body.r2 && typeof body.r2 === 'object') {
       if (typeof body.r2.enabled === 'boolean') {

@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import {
   Check,
   Copy,
+  Eye,
+  EyeOff,
   HardDrive,
   Key,
   Loader2,
@@ -59,6 +61,7 @@ export function IntegrationModal({
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [r2TestResult, setR2TestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState<boolean>(false);
+  const [showApiKey, setShowApiKey] = useState<boolean>(false);
   const [copiedEndpoint, setCopiedEndpoint] = useState<boolean>(false);
   const [copiedEnrichEndpoint, setCopiedEnrichEndpoint] = useState<boolean>(false);
   const [copiedPrompt, setCopiedPrompt] = useState<boolean>(false);
@@ -137,6 +140,7 @@ export function IntegrationModal({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          ...(regenerate ? {} : config.apiKey.trim() ? { apiKey: config.apiKey.trim() } : {}),
           webhookUrl: config.webhookUrl,
           autoPushWebhook: config.autoPushWebhook,
           pushConcurrency: nextConcurrency,
@@ -781,23 +785,48 @@ export function IntegrationModal({
               </div>
 
               <div className="space-y-1.5">
-                <label className="block text-xs text-slate-400">API Key bảo mật (Header <code className="text-[#1DB954]">X-API-Key</code>)</label>
+                <label className="block text-xs text-slate-400">
+                  API Key bảo mật (Header <code className="text-[#1DB954]">X-API-Key</code> — có thể dán key cũ của App Nhạc để khớp)
+                </label>
                 <div className="flex items-center gap-2">
-                  <input
-                    type="password"
-                    readOnly
-                    value={config.apiKey}
-                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
-                  />
+                  <div className="relative flex-1">
+                    <input
+                      type={showApiKey ? 'text' : 'password'}
+                      value={config.apiKey}
+                      onChange={(e) => setConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
+                      placeholder="sf_live_..."
+                      className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] focus:border-[#1DB954]/60 focus:outline-none pl-3 pr-9 font-mono text-xs text-slate-200"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey((v) => !v)}
+                      title={showApiKey ? 'Ẩn API Key' : 'Hiện API Key'}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white cursor-pointer"
+                    >
+                      {showApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleSaveSettings(false)}
+                    disabled={isSaving || !config.apiKey.trim()}
+                    className="h-9 px-3 rounded bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-45 text-xs font-semibold text-[#090B0E] transition-colors shrink-0 cursor-pointer whitespace-nowrap"
+                  >
+                    Lưu Key
+                  </button>
                   <button
                     type="button"
                     onClick={() => copyToClipboard(config.apiKey, 'key')}
-                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap"
                   >
                     {copiedKey ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
                     <span>{copiedKey ? 'Đã chép' : 'Sao chép'}</span>
                   </button>
                 </div>
+                <p className="text-[11px] text-slate-500">
+                  Mẹo tránh lỗi 401 khi Render tự khởi động lại: đặt biến môi trường{' '}
+                  <code className="text-slate-300">SPOTFLOW_API_KEY</code> trên Render trùng với key bên App Nhạc.
+                </p>
               </div>
 
               <div className="space-y-2 pt-2 border-t border-white/[0.06]">
