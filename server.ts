@@ -3,7 +3,7 @@ import type { Request, Response } from 'express';
 import cors from 'cors';
 import { createServer as createViteServer } from 'vite';
 import { createRequire } from 'node:module';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -31,10 +31,23 @@ const { ZipArchive } = require('archiver') as {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.DEFAULT_APP_PORT) || 3000;
+function resolveBinaryPath(candidates: string[], fallback: string): { path: string; available: boolean } {
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return { path: candidate, available: true };
+    }
+  }
+  const probe = spawnSync(fallback, ['-version'], { stdio: 'ignore', timeout: 3000 });
+  return { path: fallback, available: probe.status === 0 };
+}
+
+const PORT = Number(process.env.DEFAULT_APP_PORT || process.env.PORT) || 3000;
 const WORKSPACE_DIR = '/tmp/spotflow_downloads';
-const FFMPEG_PATH = '/usr/bin/ffmpeg';
-const FFPROBE_PATH = '/usr/bin/ffprobe';
+const RESOLVED_FFMPEG = resolveBinaryPath(['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'], 'ffmpeg');
+const RESOLVED_FFPROBE = resolveBinaryPath(['/usr/bin/ffprobe', '/usr/local/bin/ffprobe'], 'ffprobe');
+const FFMPEG_PATH = RESOLVED_FFMPEG.path;
+const FFPROBE_PATH = RESOLVED_FFPROBE.path;
+const HAS_FFMPEG = RESOLVED_FFMPEG.available;
 
 type JobState = 'queued' | 'converting' | 'done' | 'error';
 
@@ -114,24 +127,54 @@ const SETTINGS_FILE = path.join(WORKSPACE_DIR, 'integration_settings.json');
 const UPLOAD_HISTORY_FILE = path.join(WORKSPACE_DIR, 'upload_history.json');
 const jobs = new Map<string, DownloadJob>();
 let uploadHistory: UploadHistoryItem[] = [];
+function readFirstEnv(...keys: string[]): string {
+  for (const key of keys) {
+    const val = process.env[key];
+    if (typeof val === 'string' && val.trim()) {
+      return val.trim();
+    }
+  }
+  return '';
+}
+
+const ENV_R2_ACCOUNT_ID = readFirstEnv('R2_ACCOUNT_ID', 'CLOUDFLARE_R2_ACCOUNT_ID', 'CLOUDFLARE_ACCOUNT_ID');
+const ENV_R2_ACCESS_KEY_ID = readFirstEnv('R2_ACCESS_KEY_ID', 'CLOUDFLARE_R2_ACCESS_KEY_ID');
+const ENV_R2_SECRET_ACCESS_KEY = readFirstEnv('R2_SECRET_ACCESS_KEY', 'CLOUDFLARE_R2_SECRET_ACCESS_KEY');
+const ENV_R2_BUCKET_NAME = readFirstEnv(
+  'R2_BUCKET_NAME',
+  'R2_BUCKET',
+  'CLOUDFLARE_R2_BUCKET_NAME',
+  'CLOUDFLARE_R2_BUCKET'
+);
+const ENV_R2_PUBLIC_BASE_URL = normalizePublicBaseUrl(
+  readFirstEnv('R2_PUBLIC_BASE_URL', 'R2_PUBLIC_URL', 'R2_PUBLIC_DOMAIN', 'CLOUDFLARE_R2_PUBLIC_URL')
+);
+const ENV_HAS_ALL_R2 = Boolean(
+  ENV_R2_ACCOUNT_ID &&
+    ENV_R2_ACCESS_KEY_ID &&
+    ENV_R2_SECRET_ACCESS_KEY &&
+    ENV_R2_BUCKET_NAME &&
+    ENV_R2_PUBLIC_BASE_URL
+);
+const ENV_R2_ENABLED_RAW = (process.env.R2_ENABLED || '').trim().toLowerCase();
+
 const integrationSettings: IntegrationSettings = {
   apiKey: `sf_live_${crypto.randomBytes(16).toString('hex')}`,
   webhookUrl: '',
   autoPushWebhook: false,
   pushConcurrency: 4,
   r2: {
-    enabled: Boolean(
-      process.env.R2_ACCOUNT_ID &&
-        process.env.R2_ACCESS_KEY_ID &&
-        process.env.R2_SECRET_ACCESS_KEY &&
-        process.env.R2_BUCKET_NAME &&
-        process.env.R2_PUBLIC_BASE_URL
-    ),
-    accountId: (process.env.R2_ACCOUNT_ID || '').trim(),
-    accessKeyId: (process.env.R2_ACCESS_KEY_ID || '').trim(),
-    secretAccessKey: (process.env.R2_SECRET_ACCESS_KEY || '').trim(),
-    bucketName: (process.env.R2_BUCKET_NAME || '').trim(),
-    publicBaseUrl: (process.env.R2_PUBLIC_BASE_URL || '').trim().replace(/\/+$/, ''),
+    enabled:
+      ENV_R2_ENABLED_RAW === 'false'
+        ? false
+        : ENV_R2_ENABLED_RAW === 'true'
+          ? true
+          : ENV_HAS_ALL_R2,
+    accountId: ENV_R2_ACCOUNT_ID,
+    accessKeyId: ENV_R2_ACCESS_KEY_ID,
+    secretAccessKey: ENV_R2_SECRET_ACCESS_KEY,
+    bucketName: ENV_R2_BUCKET_NAME,
+    publicBaseUrl: ENV_R2_PUBLIC_BASE_URL,
   },
 };
 
@@ -228,15 +271,32 @@ async function loadIntegrationSettings(): Promise<void> {
     }
     if (parsed.r2 && typeof parsed.r2 === 'object') {
       const r2 = parsed.r2 as Partial<R2Settings>;
-      if (typeof r2.enabled === 'boolean') integrationSettings.r2.enabled = r2.enabled;
-      if (typeof r2.accountId === 'string') integrationSettings.r2.accountId = r2.accountId.trim();
-      if (typeof r2.accessKeyId === 'string') integrationSettings.r2.accessKeyId = r2.accessKeyId.trim();
+      const hasSavedR2Creds = Boolean(
+        (typeof r2.accountId === 'string' && r2.accountId.trim()) ||
+          (typeof r2.accessKeyId === 'string' && r2.accessKeyId.trim()) ||
+          (typeof r2.secretAccessKey === 'string' && r2.secretAccessKey.trim()) ||
+          (typeof r2.bucketName === 'string' && r2.bucketName.trim())
+      );
+
+      if (typeof r2.accountId === 'string' && r2.accountId.trim()) {
+        integrationSettings.r2.accountId = r2.accountId.trim();
+      }
+      if (typeof r2.accessKeyId === 'string' && r2.accessKeyId.trim()) {
+        integrationSettings.r2.accessKeyId = r2.accessKeyId.trim();
+      }
       if (typeof r2.secretAccessKey === 'string' && r2.secretAccessKey.trim()) {
         integrationSettings.r2.secretAccessKey = r2.secretAccessKey.trim();
       }
-      if (typeof r2.bucketName === 'string') integrationSettings.r2.bucketName = r2.bucketName.trim();
-      if (typeof r2.publicBaseUrl === 'string') {
+      if (typeof r2.bucketName === 'string' && r2.bucketName.trim()) {
+        integrationSettings.r2.bucketName = r2.bucketName.trim();
+      }
+      if (typeof r2.publicBaseUrl === 'string' && r2.publicBaseUrl.trim()) {
         integrationSettings.r2.publicBaseUrl = normalizePublicBaseUrl(r2.publicBaseUrl);
+      }
+      if (typeof r2.enabled === 'boolean') {
+        if (hasSavedR2Creds || !ENV_HAS_ALL_R2 || ENV_R2_ENABLED_RAW === 'false') {
+          integrationSettings.r2.enabled = r2.enabled;
+        }
       }
     }
   } catch {
@@ -1544,7 +1604,12 @@ async function startServer() {
   app.use(express.json({ limit: '2mb' }));
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, ffmpeg: fs.existsSync(FFMPEG_PATH) });
+    res.json({
+      ok: true,
+      ffmpeg: HAS_FFMPEG,
+      r2Configured: validateR2Config(integrationSettings.r2) === null,
+      r2Enabled: integrationSettings.r2.enabled,
+    });
   });
 
   app.get('/api/history', (_req: Request, res: Response) => {
