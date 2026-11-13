@@ -226,7 +226,7 @@ export function Sidebar({
 
   return (
     <>
-      <aside className="hidden lg:block w-[264px] shrink-0 h-screen sticky top-0">
+      <aside className="hidden lg:block w-[236px] shrink-0 h-screen sticky top-0">
         {sidebarBody}
       </aside>
 

@@ -152,7 +152,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#090B0E] text-slate-100 flex">
+    <div className="min-h-screen w-full max-w-full overflow-x-hidden bg-[#090B0E] text-slate-100 flex">
       <audio
         ref={audioRef}
         onTimeUpdate={() => {
@@ -181,7 +181,7 @@ export default function App() {
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
       />
 
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 w-full">
         {isBackendOnline === false && (
           <div className="bg-amber-500/15 border-b border-amber-500/30 px-4 sm:px-6 py-2 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
@@ -270,7 +270,7 @@ export default function App() {
           </div>
         )}
 
-        <main className="flex-1 flex flex-col">
+        <main className="flex-1 flex flex-col min-w-0 w-full">
           <LocalEnrichView
             bitrate={bitrate}
             embedTags={embedTags}
