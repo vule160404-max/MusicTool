@@ -55,6 +55,21 @@ interface DownloadJob {
   webhookStatus?: 'idle' | 'pushing' | 'pushed' | 'error';
   webhookMessage?: string | null;
   pushedAt?: string | null;
+  sourceFileName?: string | null;
+}
+
+interface UploadHistoryItem {
+  id: string;
+  trackKey: string;
+  fileKey: string;
+  title: string;
+  artist: string;
+  album?: string;
+  fileName: string;
+  fileSizeBytes?: number | null;
+  pushedToApp: boolean;
+  uploadedAt: string;
+  pushedAt?: string | null;
 }
 
 interface IntegrationSettings {
@@ -72,7 +87,9 @@ interface ItunesSearchResult {
 }
 
 const SETTINGS_FILE = path.join(WORKSPACE_DIR, 'integration_settings.json');
+const UPLOAD_HISTORY_FILE = path.join(WORKSPACE_DIR, 'upload_history.json');
 const jobs = new Map<string, DownloadJob>();
+let uploadHistory: UploadHistoryItem[] = [];
 const integrationSettings: IntegrationSettings = {
   apiKey: `sf_live_${crypto.randomBytes(16).toString('hex')}`,
   webhookUrl: '',
@@ -102,6 +119,28 @@ async function saveIntegrationSettings(): Promise<void> {
   try {
     await ensureWorkspace();
     await fsp.writeFile(SETTINGS_FILE, JSON.stringify(integrationSettings, null, 2), 'utf8');
+  } catch {
+    // Ignore disk write error
+  }
+}
+
+async function loadUploadHistory(): Promise<void> {
+  try {
+    if (!fs.existsSync(UPLOAD_HISTORY_FILE)) return;
+    const raw = await fsp.readFile(UPLOAD_HISTORY_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      uploadHistory = (parsed as UploadHistoryItem[]).slice(0, 2000);
+    }
+  } catch {
+    // Ignore malformed history file
+  }
+}
+
+async function saveUploadHistory(): Promise<void> {
+  try {
+    await ensureWorkspace();
+    await fsp.writeFile(UPLOAD_HISTORY_FILE, JSON.stringify(uploadHistory.slice(0, 2000), null, 2), 'utf8');
   } catch {
     // Ignore disk write error
   }
@@ -220,6 +259,84 @@ function parseTrackFilename(rawName: string): { title: string; artist: string } 
     artist: '',
     title: cleaned || withoutExt.trim() || 'Unknown Track',
   };
+}
+
+function buildFileKeyServer(fileName: string): string {
+  const withoutExt = fileName.replace(/\.[a-zA-Z0-9]{2,5}$/, '');
+  const cleaned = withoutExt
+    .replace(/^(?:y2mate\.com|yt1s\.com|snapsave\.io|x2convert\.com|mp3juices?|zmp3|nhaccuatui)\s*[-–_|]\s*/i, '')
+    .replace(/^\d{1,3}\s*[._-]\s*/, '')
+    .replace(/_/g, ' ');
+  return normalizeForMatch(cleanTrackTitleForSearch(cleaned));
+}
+
+function buildTrackKeyServer(title: string, artist: string): string {
+  const t = normalizeForMatch(cleanTrackTitleForSearch(title));
+  const a = normalizeForMatch(artist.split(',')[0] || artist);
+  if (a && t) return `${a}::${t}`;
+  return t || a;
+}
+
+async function upsertUploadHistoryItem(input: {
+  title: string;
+  artist: string;
+  album?: string;
+  fileName: string;
+  fileSizeBytes?: number | null;
+  pushedToApp?: boolean;
+  pushedAt?: string | null;
+}): Promise<UploadHistoryItem> {
+  const title = (input.title || 'Unknown Track').trim();
+  const artist = (input.artist || '').trim();
+  const fileName = (input.fileName || `${artist ? `${artist} - ` : ''}${title}.mp3`).trim();
+  const trackKey = buildTrackKeyServer(title, artist);
+  const fileKey = buildFileKeyServer(fileName);
+  const nowIso = new Date().toISOString();
+
+  const existingIdx = uploadHistory.findIndex(
+    (item) =>
+      (trackKey && item.trackKey === trackKey) ||
+      (fileKey && item.fileKey === fileKey)
+  );
+
+  if (existingIdx >= 0) {
+    const existing = uploadHistory[existingIdx];
+    const updated: UploadHistoryItem = {
+      ...existing,
+      title: title || existing.title,
+      artist: artist || existing.artist,
+      album: input.album || existing.album,
+      fileName: fileName || existing.fileName,
+      fileSizeBytes: input.fileSizeBytes ?? existing.fileSizeBytes,
+      pushedToApp: Boolean(existing.pushedToApp || input.pushedToApp),
+      pushedAt: input.pushedAt || existing.pushedAt || null,
+      uploadedAt: nowIso,
+    };
+    uploadHistory.splice(existingIdx, 1);
+    uploadHistory.unshift(updated);
+    await saveUploadHistory();
+    return updated;
+  }
+
+  const created: UploadHistoryItem = {
+    id: `hist_${crypto.randomBytes(6).toString('hex')}`,
+    trackKey,
+    fileKey,
+    title,
+    artist,
+    album: input.album || undefined,
+    fileName,
+    fileSizeBytes: input.fileSizeBytes ?? null,
+    pushedToApp: Boolean(input.pushedToApp),
+    uploadedAt: nowIso,
+    pushedAt: input.pushedAt || null,
+  };
+  uploadHistory.unshift(created);
+  if (uploadHistory.length > 2000) {
+    uploadHistory = uploadHistory.slice(0, 2000);
+  }
+  await saveUploadHistory();
+  return created;
 }
 
 function runProcessCapture(
@@ -944,6 +1061,15 @@ async function pushJobToWebhook(
       job.webhookMessage = parsedMsg || `Đã đẩy sang App (${res.status})`;
       job.pushedAt = new Date().toISOString();
       job.updatedAt = Date.now();
+      await upsertUploadHistoryItem({
+        title: job.title,
+        artist: job.artist,
+        album: job.album,
+        fileName: job.sourceFileName || job.fileName || `${job.artist} - ${job.title}.mp3`,
+        fileSizeBytes: job.fileSizeBytes,
+        pushedToApp: true,
+        pushedAt: job.pushedAt,
+      });
       return { success: true, status: res.status, message: job.webhookMessage };
     }
 
@@ -1101,6 +1227,16 @@ async function processLocalUploadJob(
         ? 'Đã gắn thẻ & đẩy sang App Nhạc'
         : 'Đã gắn ảnh bìa & lyrics hoàn tất';
     job.updatedAt = Date.now();
+
+    await upsertUploadHistoryItem({
+      title: job.title,
+      artist: job.artist,
+      album: job.album,
+      fileName: job.sourceFileName || job.fileName || `${finalBaseName}.mp3`,
+      fileSizeBytes: job.fileSizeBytes,
+      pushedToApp: job.webhookStatus === 'pushed',
+      pushedAt: job.pushedAt || null,
+    });
   } catch (err) {
     job.state = 'error';
     job.progress = 0;
@@ -1129,6 +1265,7 @@ async function cleanupOldFiles(): Promise<void> {
 async function startServer() {
   await ensureWorkspace();
   await loadIntegrationSettings();
+  await loadUploadHistory();
   setInterval(() => {
     cleanupOldFiles().catch(() => {});
   }, 15 * 60 * 1000);
@@ -1139,6 +1276,50 @@ async function startServer() {
 
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ ok: true, ffmpeg: fs.existsSync(FFMPEG_PATH) });
+  });
+
+  app.get('/api/history', (_req: Request, res: Response) => {
+    res.json({ total: uploadHistory.length, items: uploadHistory });
+  });
+
+  app.post('/api/history', async (req: Request, res: Response) => {
+    const body = req.body as {
+      items?: Array<{
+        title?: string;
+        artist?: string;
+        album?: string;
+        fileName?: string;
+        fileSizeBytes?: number | null;
+        pushedToApp?: boolean;
+      }>;
+    };
+    const list = Array.isArray(body.items) ? body.items : [];
+    for (const item of list) {
+      if (!item.title && !item.fileName) continue;
+      const parsed = item.fileName ? parseTrackFilename(item.fileName) : { title: '', artist: '' };
+      await upsertUploadHistoryItem({
+        title: (item.title || parsed.title || 'Unknown Track').trim(),
+        artist: (item.artist || parsed.artist || '').trim(),
+        album: item.album,
+        fileName: (item.fileName || `${item.artist ? `${item.artist} - ` : ''}${item.title}.mp3`).trim(),
+        fileSizeBytes: item.fileSizeBytes ?? null,
+        pushedToApp: Boolean(item.pushedToApp),
+      });
+    }
+    res.json({ total: uploadHistory.length, items: uploadHistory });
+  });
+
+  app.delete('/api/history/:id', async (req: Request, res: Response) => {
+    const id = String(req.params.id);
+    uploadHistory = uploadHistory.filter((item) => item.id !== id);
+    await saveUploadHistory();
+    res.json({ total: uploadHistory.length, items: uploadHistory });
+  });
+
+  app.delete('/api/history', async (_req: Request, res: Response) => {
+    uploadHistory = [];
+    await saveUploadHistory();
+    res.json({ total: 0, items: [] });
   });
 
   app.get('/api/integration/settings', (_req: Request, res: Response) => {
@@ -1365,6 +1546,7 @@ async function startServer() {
       message: 'Đang chờ nhận file âm thanh...',
       filePath: null,
       fileName: body.fileName || null,
+      sourceFileName: body.fileName || null,
       fileSizeBytes: null,
       error: null,
       createdAt: Date.now(),

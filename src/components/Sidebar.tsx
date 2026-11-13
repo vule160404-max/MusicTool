@@ -1,4 +1,4 @@
-import { Disc3, FileAudio, SlidersHorizontal, Webhook, X } from 'lucide-react';
+import { Disc3, FileAudio, History, SlidersHorizontal, Webhook, X } from 'lucide-react';
 import type { AudioBitrate } from '../types';
 
 interface SidebarProps {
@@ -10,9 +10,13 @@ interface SidebarProps {
   onToggleAutoProcessOnUpload: () => void;
   autoDownloadEach: boolean;
   onToggleAutoDownloadEach: () => void;
+  skipDuplicates: boolean;
+  onToggleSkipDuplicates: () => void;
   totalEntries: number;
   doneCount: number;
   totalSizeMb: string;
+  historyCount: number;
+  onOpenHistoryModal: () => void;
   onOpenIntegrationModal: () => void;
   isOpenMobile: boolean;
   onCloseMobile: () => void;
@@ -27,9 +31,13 @@ export function Sidebar({
   onToggleAutoProcessOnUpload,
   autoDownloadEach,
   onToggleAutoDownloadEach,
+  skipDuplicates,
+  onToggleSkipDuplicates,
   totalEntries,
   doneCount,
   totalSizeMb,
+  historyCount,
+  onOpenHistoryModal,
   onOpenIntegrationModal,
   isOpenMobile,
   onCloseMobile,
@@ -172,6 +180,33 @@ export function Sidebar({
               />
             </button>
           </div>
+
+          {/* Skip Duplicate Uploads Toggle */}
+          <div className="flex items-start justify-between gap-3 pt-2">
+            <div>
+              <div className="text-xs font-medium text-slate-200">
+                Tự loại bài trùng từ lịch sử
+              </div>
+              <div className="text-xs text-slate-500">
+                Bỏ qua bài đã xử lý hoặc đã đẩy trước đó khi nạp file mới
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={skipDuplicates}
+              onClick={onToggleSkipDuplicates}
+              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1DB954] ${
+                skipDuplicates ? 'bg-[#1DB954]' : 'bg-slate-700'
+              }`}
+            >
+              <span
+                className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  skipDuplicates ? 'translate-x-4' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </div>
         </div>
 
         {/* Session Summary */}
@@ -193,7 +228,23 @@ export function Sidebar({
               <span>Tổng dung lượng</span>
               <span className="font-mono tabular-nums text-slate-200">{totalSizeMb} MB</span>
             </div>
+            <div className="flex items-center justify-between text-slate-400">
+              <span>Đã lưu trong lịch sử</span>
+              <span className="font-mono tabular-nums text-slate-200">{historyCount} bài</span>
+            </div>
           </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              onOpenHistoryModal();
+              onCloseMobile();
+            }}
+            className="w-full py-2 px-3 rounded-md border border-white/[0.12] bg-white/[0.04] hover:bg-white/[0.09] text-xs font-medium text-slate-200 transition-colors flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+          >
+            <History className="h-3.5 w-3.5 text-[#1DB954]" />
+            <span>Lịch sử đã upload ({historyCount})</span>
+          </button>
         </div>
 
         {/* R2 Integration Shortcut */}

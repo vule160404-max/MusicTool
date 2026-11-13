@@ -5,6 +5,7 @@ import {
   Download,
   FileArchive,
   FileAudio,
+  History,
   Image as ImageIcon,
   Loader2,
   Music,
@@ -18,24 +19,55 @@ import {
   Webhook,
   X,
 } from 'lucide-react';
-import type { AudioBitrate, DownloadJob, EnrichedMetadata, LocalTrackEntry } from '../types';
+import type {
+  AudioBitrate,
+  DownloadJob,
+  EnrichedMetadata,
+  LocalTrackEntry,
+  UploadHistoryItem,
+} from '../types';
 import { apiFetch, getBackendBaseUrl } from '../utils/api';
 import { readLocalAudioHints } from '../utils/localAudioHints';
+import {
+  findDuplicateHistoryMatch,
+  normalizeFileKey,
+  normalizeTrackKey,
+} from '../utils/trackHistory';
+
+interface SkippedDuplicateInfo {
+  file: File;
+  fileName: string;
+  matchedLabel: string;
+  reason: 'history' | 'current';
+}
 
 interface LocalEnrichViewProps {
   bitrate: AudioBitrate;
   embedTags: boolean;
   autoProcessOnUpload: boolean;
   autoDownloadEach: boolean;
+  skipDuplicates: boolean;
   webhookUrl: string;
   completedJobs: DownloadJob[];
+  historyItems: UploadHistoryItem[];
   playingLocalId: string | null;
   isPlaying: boolean;
   onTogglePlayEntry: (entry: LocalTrackEntry) => void;
   showToast: (msg: string) => void;
   onOpenIntegrationModal: () => void;
+  onOpenHistoryModal: () => void;
   onStatsChange: (stats: { totalEntries: number; doneCount: number; totalSizeMb: string }) => void;
   onJobsUpdated: (jobs: DownloadJob[]) => void;
+  onRecordHistory: (
+    items: Array<{
+      title: string;
+      artist: string;
+      album?: string;
+      fileName: string;
+      fileSizeBytes?: number | null;
+      pushedToApp?: boolean;
+    }>
+  ) => Promise<void>;
 }
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -75,19 +107,25 @@ export function LocalEnrichView({
   embedTags,
   autoProcessOnUpload,
   autoDownloadEach,
+  skipDuplicates,
   webhookUrl,
   completedJobs,
+  historyItems,
   playingLocalId,
   isPlaying,
   onTogglePlayEntry,
   showToast,
   onOpenIntegrationModal,
+  onOpenHistoryModal,
   onStatsChange,
   onJobsUpdated,
+  onRecordHistory,
 }: LocalEnrichViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lrcInputRef = useRef<HTMLInputElement | null>(null);
   const [entries, setEntries] = useState<LocalTrackEntry[]>([]);
+  const [skippedDuplicates, setSkippedDuplicates] = useState<SkippedDuplicateInfo[]>([]);
+  const [showSkippedDetails, setShowSkippedDetails] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isProcessingAll, setIsProcessingAll] = useState<boolean>(false);
   const [isZipping, setIsZipping] = useState<boolean>(false);
@@ -279,6 +317,18 @@ export function LocalEnrichView({
       const finalJob = await pollJobUntilDone(entry.localId, prepData.jobId);
       if (finalJob) {
         onJobsUpdated([finalJob]);
+        if (finalJob.state === 'done') {
+          onRecordHistory([
+            {
+              title: finalJob.title,
+              artist: finalJob.artist,
+              album: finalJob.album,
+              fileName: entry.fileName || finalJob.fileName || `${finalJob.title}.mp3`,
+              fileSizeBytes: finalJob.fileSizeBytes,
+              pushedToApp: finalJob.webhookStatus === 'pushed',
+            },
+          ]).catch(() => {});
+        }
       }
       return finalJob;
     } catch (err) {
@@ -304,9 +354,15 @@ export function LocalEnrichView({
     }
   };
 
-  const handleFilesSelected = async (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) return;
-    const allFiles = Array.from(fileList);
+  const handleFilesSelected = async (
+    fileList: FileList | File[] | null,
+    options?: { forceIncludeDuplicates?: boolean }
+  ) => {
+    if (!fileList) return;
+    const allFiles = Array.isArray(fileList) ? fileList : Array.from(fileList);
+    if (allFiles.length === 0) return;
+
+    const forceInclude = Boolean(options?.forceIncludeDuplicates);
     const validFiles = allFiles.filter((f) =>
       /\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(f.name)
     );
@@ -366,38 +422,92 @@ export function LocalEnrichView({
       return;
     }
 
-    const createdWithHints = await Promise.all(
-      validFiles.map(async (file) => {
-        const guessed = guessTitleArtistFromName(file.name);
-        const hints = await readLocalAudioHints(file);
-        const pairedLrc = lrcMap.get(normalizeStem(file.name));
-        const embeddedIsLrc = hints.lyrics ? /\[\d{1,2}:\d{2}/.test(hints.lyrics) : false;
-
-        const entry: LocalTrackEntry = {
-          localId: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          file,
-          fileName: file.name,
-          fileSizeBytes: file.size,
-          title: hints.title || guessed.title,
-          artist: hints.artist || guessed.artist,
-          album: hints.album || '',
-          coverUrl: '',
-          durationMs: hints.durationSec ? hints.durationSec * 1000 : 0,
-          syncedLyrics:
-            pairedLrc?.syncedLyrics ?? (embeddedIsLrc ? hints.lyrics || null : null),
-          plainLyrics:
-            pairedLrc?.plainLyrics ?? (hints.lyrics || null),
-          isEnriching: true,
-          enrichMatched: false,
-        };
-
-        return { entry, durationSec: hints.durationSec };
-      })
+    const existingFileKeys = new Set(entries.map((e) => normalizeFileKey(e.fileName)));
+    const existingTrackKeys = new Set(
+      entries.map((e) => normalizeTrackKey(e.title, e.artist)).filter(Boolean)
     );
 
-    setEntries((prev) => [...prev, ...createdWithHints.map((c) => c.entry)]);
+    const skippedList: SkippedDuplicateInfo[] = [];
+    const acceptedItems: Array<{ entry: LocalTrackEntry; durationSec?: number }> = [];
 
-    const queue = [...createdWithHints];
+    for (const file of validFiles) {
+      const guessed = guessTitleArtistFromName(file.name);
+      const hints = await readLocalAudioHints(file);
+      const title = hints.title || guessed.title;
+      const artist = hints.artist || guessed.artist;
+
+      if (skipDuplicates && !forceInclude) {
+        const fKey = normalizeFileKey(file.name);
+        const tKey = normalizeTrackKey(title, artist);
+        const histMatch = findDuplicateHistoryMatch(
+          { fileName: file.name, title, artist },
+          historyItems
+        );
+        if (histMatch) {
+          skippedList.push({
+            file,
+            fileName: file.name,
+            matchedLabel: `${histMatch.title}${histMatch.artist ? ` — ${histMatch.artist}` : ''}`,
+            reason: 'history',
+          });
+          continue;
+        }
+        if ((fKey && existingFileKeys.has(fKey)) || (tKey && existingTrackKeys.has(tKey))) {
+          skippedList.push({
+            file,
+            fileName: file.name,
+            matchedLabel: `${title}${artist ? ` — ${artist}` : ''}`,
+            reason: 'current',
+          });
+          continue;
+        }
+        if (fKey) existingFileKeys.add(fKey);
+        if (tKey) existingTrackKeys.add(tKey);
+      }
+
+      const pairedLrc = lrcMap.get(normalizeStem(file.name));
+      const embeddedIsLrc = hints.lyrics ? /\[\d{1,2}:\d{2}/.test(hints.lyrics) : false;
+
+      const entry: LocalTrackEntry = {
+        localId: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        file,
+        fileName: file.name,
+        fileSizeBytes: file.size,
+        title,
+        artist,
+        album: hints.album || '',
+        coverUrl: '',
+        durationMs: hints.durationSec ? hints.durationSec * 1000 : 0,
+        syncedLyrics: pairedLrc?.syncedLyrics ?? (embeddedIsLrc ? hints.lyrics || null : null),
+        plainLyrics: pairedLrc?.plainLyrics ?? (hints.lyrics || null),
+        isEnriching: true,
+        enrichMatched: false,
+      };
+
+      acceptedItems.push({ entry, durationSec: hints.durationSec });
+    }
+
+    if (skippedList.length > 0) {
+      setSkippedDuplicates(skippedList);
+      setShowSkippedDetails(false);
+      if (acceptedItems.length === 0) {
+        showToast(
+          `Tất cả ${skippedList.length} bài đều trùng với lịch sử hoặc danh sách hiện tại nên đã được tự động loại bỏ.`
+        );
+        return;
+      }
+      showToast(
+        `Đã loại ${skippedList.length} bài trùng — giữ lại ${acceptedItems.length} bài mới để xử lý.`
+      );
+    } else if (forceInclude) {
+      setSkippedDuplicates([]);
+    }
+
+    if (acceptedItems.length === 0) return;
+
+    setEntries((prev) => [...prev, ...acceptedItems.map((c) => c.entry)]);
+
+    const queue = [...acceptedItems];
     const workers = Array.from({ length: Math.min(3, queue.length) }).map(async () => {
       while (queue.length > 0) {
         const next = queue.shift();
@@ -531,7 +641,21 @@ export function LocalEnrichView({
         setEntries((prev) =>
           prev.map((e) => (e.job && updatedMap[e.job.jobId] ? { ...e, job: updatedMap[e.job.jobId] } : e))
         );
-        onJobsUpdated(Object.values(updatedMap));
+        const updatedList = Object.values(updatedMap);
+        onJobsUpdated(updatedList);
+        const pushedList = updatedList.filter((j) => j.webhookStatus === 'pushed');
+        if (pushedList.length > 0) {
+          onRecordHistory(
+            pushedList.map((j) => ({
+              title: j.title,
+              artist: j.artist,
+              album: j.album,
+              fileName: j.fileName || `${j.artist} - ${j.title}.mp3`,
+              fileSizeBytes: j.fileSizeBytes,
+              pushedToApp: true,
+            }))
+          ).catch(() => {});
+        }
       }
 
       const pushedCount = data.pushedCount || 0;
@@ -735,10 +859,80 @@ export function LocalEnrichView({
               Kéo thả hàng loạt file MP3 thô vào đây hoặc bấm để chọn file từ máy tính
             </div>
             <div className="text-xs text-slate-400">
-              Tự đọc thẻ ID3 gốc, dò đa nguồn (LRCLIB · NetEase · Lyrics.ovh) và hỗ trợ thả kèm file <span className="font-mono text-slate-300">.lrc</span> trùng tên.
+              Tự đọc thẻ ID3 gốc, dò đa nguồn (LRCLIB · NetEase · Lyrics.ovh), hỗ trợ thả kèm file{' '}
+              <span className="font-mono text-slate-300">.lrc</span> và{' '}
+              {skipDuplicates ? (
+                <span className="text-[#1DB954]">tự loại bài trùng từ lịch sử ({historyItems.length} bài đã lưu)</span>
+              ) : (
+                <span>đang tắt bộ lọc trùng lịch sử</span>
+              )}
+              .
             </div>
           </div>
         </div>
+
+        {skippedDuplicates.length > 0 && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-200 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertCircle className="h-4 w-4 text-amber-400 shrink-0" />
+                <span>
+                  Đã tự động loại <strong>{skippedDuplicates.length} bài trùng</strong> với lịch sử đã upload / danh sách hiện tại.
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowSkippedDetails((v) => !v)}
+                  className="px-2 py-1 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs text-amber-100 cursor-pointer"
+                >
+                  {showSkippedDetails ? 'Ẩn danh sách' : 'Xem bài đã loại'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleFilesSelected(
+                      skippedDuplicates.map((s) => s.file),
+                      { forceIncludeDuplicates: true }
+                    )
+                  }
+                  className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0E] font-semibold text-xs cursor-pointer"
+                >
+                  Vẫn nạp {skippedDuplicates.length} bài này
+                </button>
+                <button
+                  type="button"
+                  onClick={onOpenHistoryModal}
+                  className="px-2 py-1 rounded border border-white/[0.15] hover:bg-white/[0.08] text-xs text-white cursor-pointer inline-flex items-center gap-1"
+                >
+                  <History className="h-3 w-3" />
+                  <span>Lịch sử</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSkippedDuplicates([])}
+                  aria-label="Đóng thông báo bài trùng"
+                  className="p-1 text-amber-300 hover:text-white cursor-pointer"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {showSkippedDetails && (
+              <div className="max-h-32 overflow-y-auto border-t border-amber-500/20 pt-2 space-y-1 font-mono text-[11px] text-amber-100/90">
+                {skippedDuplicates.map((s, idx) => (
+                  <div key={`${s.fileName}_${idx}`} className="truncate">
+                    • {s.fileName}{' '}
+                    <span className="text-amber-300/75">
+                      ({s.reason === 'history' ? `trùng lịch sử: ${s.matchedLabel}` : 'đã có trong bảng'})
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {entries.length > 0 && (
           <div className="flex flex-wrap items-center justify-between gap-2.5 pt-0.5">
@@ -988,9 +1182,21 @@ export function LocalEnrichView({
                             <span className="hidden xl:inline">Tìm lại</span>
                           </button>
                         </div>
-                        <div className="text-[11px] text-slate-500 font-mono truncate">
-                          {entry.fileName}
-                          {entry.album ? ` · ${entry.album}` : ''}
+                        <div className="flex items-center gap-2 text-[11px] text-slate-500 font-mono truncate">
+                          <span className="truncate">
+                            {entry.fileName}
+                            {entry.album ? ` · ${entry.album}` : ''}
+                          </span>
+                          {!skipDuplicates &&
+                            !entry.job &&
+                            Boolean(
+                              findDuplicateHistoryMatch(
+                                { fileName: entry.fileName, title: entry.title, artist: entry.artist },
+                                historyItems
+                              )
+                            ) && (
+                              <span className="text-amber-400 shrink-0">· Đã từng up</span>
+                            )}
                         </div>
                       </div>
                     </td>

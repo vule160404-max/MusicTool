@@ -1,20 +1,43 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Menu, Server, Webhook } from 'lucide-react';
+import { AlertTriangle, History, Menu, Server, Webhook } from 'lucide-react';
 import { Sidebar } from './components/Sidebar';
 import { LocalEnrichView } from './components/LocalEnrichView';
 import { AudioPlayerDock } from './components/AudioPlayerDock';
 import { IntegrationModal } from './components/IntegrationModal';
 import { BackendConnectionModal } from './components/BackendConnectionModal';
+import { HistoryModal } from './components/HistoryModal';
 import { apiFetch, checkBackendStatus, getBackendBaseUrl } from './utils/api';
-import type { AudioBitrate, DownloadJob, IntegrationConfig, LocalTrackEntry } from './types';
+import {
+  loadLocalUploadHistory,
+  mergeUploadHistories,
+  saveLocalUploadHistory,
+} from './utils/trackHistory';
+import type {
+  AudioBitrate,
+  DownloadJob,
+  IntegrationConfig,
+  LocalTrackEntry,
+  UploadHistoryItem,
+} from './types';
 
 export default function App() {
   const [bitrate, setBitrate] = useState<AudioBitrate>(320);
   const [embedTags, setEmbedTags] = useState<boolean>(true);
   const [autoProcessOnUpload, setAutoProcessOnUpload] = useState<boolean>(false);
   const [autoDownloadEach, setAutoDownloadEach] = useState<boolean>(false);
+  const [skipDuplicates, setSkipDuplicates] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('spotflow_skip_duplicates');
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
 
   const [completedJobs, setCompletedJobs] = useState<DownloadJob[]>([]);
+  const [historyItems, setHistoryItems] = useState<UploadHistoryItem[]>(() =>
+    loadLocalUploadHistory()
+  );
   const [integrationConfig, setIntegrationConfig] = useState<IntegrationConfig>({
     apiKey: '',
     webhookUrl: '',
@@ -28,6 +51,7 @@ export default function App() {
 
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState<boolean>(false);
   const [isIntegrationModalOpen, setIsIntegrationModalOpen] = useState<boolean>(false);
+  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState<boolean>(false);
   const [isBackendModalOpen, setIsBackendModalOpen] = useState<boolean>(false);
   const [isBackendOnline, setIsBackendOnline] = useState<boolean | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -63,23 +87,147 @@ export default function App() {
     }
   }, []);
 
+  const syncUploadHistory = useCallback(async () => {
+    try {
+      const localItems = loadLocalUploadHistory();
+      const res = await apiFetch('/api/history');
+      if (!res.ok) return;
+      const data = (await res.json()) as { items?: UploadHistoryItem[] };
+      const serverItems = Array.isArray(data.items) ? data.items : [];
+      const merged = mergeUploadHistories(serverItems, localItems);
+      setHistoryItems(merged);
+      saveLocalUploadHistory(merged);
+
+      // Push any browser-cached items missing on server (e.g. after server restart)
+      if (localItems.length > serverItems.length) {
+        const serverKeys = new Set(serverItems.map((i) => i.trackKey || i.fileKey));
+        const missingOnServer = localItems.filter(
+          (i) => !serverKeys.has(i.trackKey || i.fileKey)
+        );
+        if (missingOnServer.length > 0) {
+          await apiFetch('/api/history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: missingOnServer }),
+          });
+        }
+      }
+    } catch {
+      // Keep localStorage items if server unreachable
+    }
+  }, []);
+
+  const recordHistoryItems = useCallback(
+    async (
+      items: Array<{
+        title: string;
+        artist: string;
+        album?: string;
+        fileName: string;
+        fileSizeBytes?: number | null;
+        pushedToApp?: boolean;
+      }>
+    ) => {
+      if (items.length === 0) return;
+      try {
+        const res = await apiFetch('/api/history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { items?: UploadHistoryItem[] };
+          const serverItems = Array.isArray(data.items) ? data.items : [];
+          const merged = mergeUploadHistories(serverItems, loadLocalUploadHistory());
+          setHistoryItems(merged);
+          saveLocalUploadHistory(merged);
+        }
+      } catch {
+        // Ignore transient failure
+      }
+    },
+    []
+  );
+
+  const handleDeleteHistoryItem = useCallback(
+    async (id: string) => {
+      const nextLocal = historyItems.filter((i) => i.id !== id);
+      setHistoryItems(nextLocal);
+      saveLocalUploadHistory(nextLocal);
+      try {
+        await apiFetch(`/api/history/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      } catch {
+        // Ignore
+      }
+      showToast('Đã xóa bài hát khỏi lịch sử.');
+    },
+    [historyItems, showToast]
+  );
+
+  const handleClearAllHistory = useCallback(async () => {
+    setHistoryItems([]);
+    saveLocalUploadHistory([]);
+    try {
+      await apiFetch('/api/history', { method: 'DELETE' });
+    } catch {
+      // Ignore
+    }
+    showToast('Đã xóa toàn bộ lịch sử upload.');
+  }, [showToast]);
+
+  const handleImportHistoryNames = useCallback(
+    async (lines: string[]) => {
+      const items = lines.map((line) => {
+        const cleanLine = line.trim();
+        const isFile = /\.(mp3|m4a|wav|ogg|flac|mp4|webm)$/i.test(cleanLine);
+        const sep = cleanLine.replace(/\.[a-zA-Z0-9]{2,5}$/, '').match(/^(.+?)\s+[-–—]\s+(.+)$/);
+        return {
+          title: sep ? sep[2].trim() : cleanLine.replace(/\.[a-zA-Z0-9]{2,5}$/, ''),
+          artist: sep ? sep[1].trim() : '',
+          fileName: isFile ? cleanLine : `${cleanLine}.mp3`,
+          pushedToApp: true,
+        };
+      });
+      await recordHistoryItems(items);
+      showToast(`Đã thêm ${items.length} bài hát vào lịch sử để lọc trùng.`);
+    },
+    [recordHistoryItems, showToast]
+  );
+
   const refreshBackendStatus = useCallback(async () => {
     const status = await checkBackendStatus();
     setIsBackendOnline(status.ok);
     if (status.ok) {
       loadIntegrationSettings();
+      syncUploadHistory();
     }
-  }, [loadIntegrationSettings]);
+  }, [loadIntegrationSettings, syncUploadHistory]);
 
-  const handleJobsUpdated = useCallback((newJobs: DownloadJob[]) => {
-    setCompletedJobs((prev) => {
-      const map = new Map(prev.map((j) => [j.jobId, j]));
-      for (const j of newJobs) {
-        if (j.state === 'done') map.set(j.jobId, j);
+  const handleJobsUpdated = useCallback(
+    (newJobs: DownloadJob[]) => {
+      setCompletedJobs((prev) => {
+        const map = new Map(prev.map((j) => [j.jobId, j]));
+        for (const j of newJobs) {
+          if (j.state === 'done') map.set(j.jobId, j);
+        }
+        return Array.from(map.values());
+      });
+      const pushed = newJobs.filter((j) => j.state === 'done' && j.webhookStatus === 'pushed');
+      if (pushed.length > 0) {
+        recordHistoryItems(
+          pushed.map((j) => ({
+            title: j.title,
+            artist: j.artist,
+            album: j.album,
+            fileName: j.fileName || `${j.artist} - ${j.title}.mp3`,
+            fileSizeBytes: j.fileSizeBytes,
+            pushedToApp: true,
+          }))
+        ).catch(() => {});
       }
-      return Array.from(map.values());
-    });
-  }, []);
+    },
+    [recordHistoryItems]
+  );
 
   useEffect(() => {
     refreshBackendStatus();
@@ -173,9 +321,23 @@ export default function App() {
         onToggleAutoProcessOnUpload={() => setAutoProcessOnUpload((v) => !v)}
         autoDownloadEach={autoDownloadEach}
         onToggleAutoDownloadEach={() => setAutoDownloadEach((v) => !v)}
+        skipDuplicates={skipDuplicates}
+        onToggleSkipDuplicates={() => {
+          setSkipDuplicates((v) => {
+            const next = !v;
+            try {
+              localStorage.setItem('spotflow_skip_duplicates', String(next));
+            } catch {
+              // Ignore
+            }
+            return next;
+          });
+        }}
         totalEntries={stats.totalEntries}
         doneCount={stats.doneCount}
         totalSizeMb={stats.totalSizeMb}
+        historyCount={historyItems.length}
+        onOpenHistoryModal={() => setIsHistoryModalOpen(true)}
         onOpenIntegrationModal={() => setIsIntegrationModalOpen(true)}
         isOpenMobile={isMobileSidebarOpen}
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
@@ -228,6 +390,16 @@ export default function App() {
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
+              onClick={() => setIsHistoryModalOpen(true)}
+              title="Xem lịch sử bài hát đã upload & lọc trùng"
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md border border-white/[0.1] bg-white/[0.04] hover:bg-white/[0.08] text-xs font-medium text-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <History className="h-3.5 w-3.5 text-[#1DB954]" />
+              <span>Lịch sử ({historyItems.length})</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setIsBackendModalOpen(true)}
               title="Cấu hình kết nối máy chủ Backend"
               className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-md border text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
@@ -276,15 +448,19 @@ export default function App() {
             embedTags={embedTags}
             autoProcessOnUpload={autoProcessOnUpload}
             autoDownloadEach={autoDownloadEach}
+            skipDuplicates={skipDuplicates}
             webhookUrl={integrationConfig.webhookUrl}
             completedJobs={completedJobs}
+            historyItems={historyItems}
             playingLocalId={playingEntry?.localId || null}
             isPlaying={isPlaying}
             onTogglePlayEntry={handleTogglePlayEntry}
             showToast={showToast}
             onOpenIntegrationModal={() => setIsIntegrationModalOpen(true)}
+            onOpenHistoryModal={() => setIsHistoryModalOpen(true)}
             onStatsChange={setStats}
             onJobsUpdated={handleJobsUpdated}
+            onRecordHistory={recordHistoryItems}
           />
         </main>
 
@@ -323,6 +499,16 @@ export default function App() {
           showToast={showToast}
           onSettingsSaved={setIntegrationConfig}
           onJobsUpdated={handleJobsUpdated}
+        />
+
+        <HistoryModal
+          isOpen={isHistoryModalOpen}
+          onClose={() => setIsHistoryModalOpen(false)}
+          items={historyItems}
+          onDeleteItem={handleDeleteHistoryItem}
+          onClearAll={handleClearAllHistory}
+          onImportNames={handleImportHistoryNames}
+          showToast={showToast}
         />
 
         <BackendConnectionModal

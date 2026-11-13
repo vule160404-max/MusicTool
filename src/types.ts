@@ -59,3 +59,18 @@ export interface LocalTrackEntry {
   enrichMatched: boolean;
   job?: DownloadJob;
 }
+
+export interface UploadHistoryItem {
+  id: string;
+  trackKey: string;
+  fileKey: string;
+  title: string;
+  artist: string;
+  album?: string;
+  fileName: string;
+  fileSizeBytes?: number | null;
+  pushedToApp: boolean;
+  uploadedAt: string;
+  pushedAt?: string | null;
+}
+
