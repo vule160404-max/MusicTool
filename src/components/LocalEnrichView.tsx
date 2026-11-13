@@ -11,6 +11,7 @@ import {
   Pause,
   Play,
   RefreshCw,
+  Search,
   Send,
   Trash2,
   Upload,
@@ -19,6 +20,7 @@ import {
 } from 'lucide-react';
 import type { AudioBitrate, DownloadJob, EnrichedMetadata, LocalTrackEntry } from '../types';
 import { apiFetch, getBackendBaseUrl } from '../utils/api';
+import { readLocalAudioHints } from '../utils/localAudioHints';
 
 interface LocalEnrichViewProps {
   bitrate: AudioBitrate;
@@ -84,13 +86,19 @@ export function LocalEnrichView({
   onJobsUpdated,
 }: LocalEnrichViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const lrcInputRef = useRef<HTMLInputElement | null>(null);
   const [entries, setEntries] = useState<LocalTrackEntry[]>([]);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isProcessingAll, setIsProcessingAll] = useState<boolean>(false);
   const [isZipping, setIsZipping] = useState<boolean>(false);
   const [isPushingAll, setIsPushingAll] = useState<boolean>(false);
+  const [isSearchingMissingLyrics, setIsSearchingMissingLyrics] = useState<boolean>(false);
   const [pushingJobIds, setPushingJobIds] = useState<Set<string>>(new Set());
   const [editingLyricsId, setEditingLyricsId] = useState<string | null>(null);
+  const [modalSearchTitle, setModalSearchTitle] = useState<string>('');
+  const [modalSearchArtist, setModalSearchArtist] = useState<string>('');
+  const [isModalSearching, setIsModalSearching] = useState<boolean>(false);
+  const [modalSearchNote, setModalSearchNote] = useState<string | null>(null);
   const [editingCoverId, setEditingCoverId] = useState<string | null>(null);
 
   const autoDownloadRef = useRef(autoDownloadEach);
@@ -148,7 +156,13 @@ export function LocalEnrichView({
 
   const enrichSingleEntry = async (
     localId: string,
-    payload: { fileName?: string; title?: string; artist?: string }
+    payload: {
+      fileName?: string;
+      title?: string;
+      artist?: string;
+      album?: string;
+      durationSec?: number;
+    }
   ): Promise<EnrichedMetadata | null> => {
     setEntries((prev) =>
       prev.map((e) => (e.localId === localId ? { ...e, isEnriching: true } : e))
@@ -292,54 +306,123 @@ export function LocalEnrichView({
 
   const handleFilesSelected = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
-    const validFiles = Array.from(fileList).filter((f) =>
+    const allFiles = Array.from(fileList);
+    const validFiles = allFiles.filter((f) =>
       /\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(f.name)
     );
+    const lyricFiles = allFiles.filter((f) => /\.(lrc|txt)$/i.test(f.name));
+
+    const normalizeStem = (name: string) =>
+      name
+        .replace(/\.[a-zA-Z0-9]{2,5}$/, '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    const lrcMap = new Map<string, { syncedLyrics: string | null; plainLyrics: string }>();
+    for (const lf of lyricFiles) {
+      try {
+        const text = (await lf.text()).trim();
+        if (text.length > 10) {
+          const isLrc = /\[\d{1,2}:\d{2}/.test(text);
+          const plain = isLrc
+            ? text
+                .split(/\r?\n/)
+                .map((l) => l.replace(/\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/g, '').trim())
+                .filter(Boolean)
+                .join('\n')
+            : text;
+          lrcMap.set(normalizeStem(lf.name), {
+            syncedLyrics: isLrc ? text : null,
+            plainLyrics: plain || text,
+          });
+        }
+      } catch {
+        // Ignore unreadable text file
+      }
+    }
+
     if (validFiles.length === 0) {
-      showToast('Vui lòng chọn file âm thanh (.mp3, .m4a, .wav) hoặc video (.mp4, .webm).');
+      if (lrcMap.size > 0) {
+        let pairedCount = 0;
+        setEntries((prev) =>
+          prev.map((e) => {
+            const match = lrcMap.get(normalizeStem(e.fileName));
+            if (match) {
+              pairedCount++;
+              return { ...e, syncedLyrics: match.syncedLyrics, plainLyrics: match.plainLyrics };
+            }
+            return e;
+          })
+        );
+        showToast(
+          pairedCount > 0
+            ? `Đã ghép lyrics từ file .LRC/.TXT vào ${pairedCount} bài hát.`
+            : 'Không tìm thấy bài MP3 nào trùng tên với file .LRC/.TXT vừa thả.'
+        );
+      } else {
+        showToast('Vui lòng chọn file âm thanh (.mp3, .m4a, .wav), video (.mp4, .webm) hoặc kèm file .lrc.');
+      }
       return;
     }
 
-    const created: LocalTrackEntry[] = validFiles.map((file) => {
-      const guessed = guessTitleArtistFromName(file.name);
-      return {
-        localId: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        file,
-        fileName: file.name,
-        fileSizeBytes: file.size,
-        title: guessed.title,
-        artist: guessed.artist,
-        album: '',
-        coverUrl: '',
-        durationMs: 0,
-        syncedLyrics: null,
-        plainLyrics: null,
-        isEnriching: true,
-        enrichMatched: false,
-      };
-    });
+    const createdWithHints = await Promise.all(
+      validFiles.map(async (file) => {
+        const guessed = guessTitleArtistFromName(file.name);
+        const hints = await readLocalAudioHints(file);
+        const pairedLrc = lrcMap.get(normalizeStem(file.name));
+        const embeddedIsLrc = hints.lyrics ? /\[\d{1,2}:\d{2}/.test(hints.lyrics) : false;
 
-    setEntries((prev) => [...prev, ...created]);
+        const entry: LocalTrackEntry = {
+          localId: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          file,
+          fileName: file.name,
+          fileSizeBytes: file.size,
+          title: hints.title || guessed.title,
+          artist: hints.artist || guessed.artist,
+          album: hints.album || '',
+          coverUrl: '',
+          durationMs: hints.durationSec ? hints.durationSec * 1000 : 0,
+          syncedLyrics:
+            pairedLrc?.syncedLyrics ?? (embeddedIsLrc ? hints.lyrics || null : null),
+          plainLyrics:
+            pairedLrc?.plainLyrics ?? (hints.lyrics || null),
+          isEnriching: true,
+          enrichMatched: false,
+        };
 
-    const queue = [...created];
+        return { entry, durationSec: hints.durationSec };
+      })
+    );
+
+    setEntries((prev) => [...prev, ...createdWithHints.map((c) => c.entry)]);
+
+    const queue = [...createdWithHints];
     const workers = Array.from({ length: Math.min(3, queue.length) }).map(async () => {
       while (queue.length > 0) {
         const next = queue.shift();
         if (!next) break;
-        const enriched = await enrichSingleEntry(next.localId, { fileName: next.fileName });
+        const { entry, durationSec } = next;
+        const enriched = await enrichSingleEntry(entry.localId, {
+          fileName: entry.fileName,
+          title: entry.title,
+          artist: entry.artist,
+          album: entry.album || undefined,
+          durationSec,
+        });
         if (autoProcessOnUpload) {
           const mergedEntry: LocalTrackEntry = enriched
             ? {
-                ...next,
-                title: enriched.title || next.title,
-                artist: enriched.artist || next.artist,
-                album: enriched.album || next.album,
-                coverUrl: enriched.coverUrl || next.coverUrl,
-                durationMs: enriched.durationMs || next.durationMs,
-                syncedLyrics: enriched.syncedLyrics ?? next.syncedLyrics,
-                plainLyrics: enriched.plainLyrics ?? next.plainLyrics,
+                ...entry,
+                title: enriched.title || entry.title,
+                artist: enriched.artist || entry.artist,
+                album: enriched.album || entry.album,
+                coverUrl: enriched.coverUrl || entry.coverUrl,
+                durationMs: enriched.durationMs || entry.durationMs,
+                syncedLyrics: enriched.syncedLyrics ?? entry.syncedLyrics,
+                plainLyrics: enriched.plainLyrics ?? entry.plainLyrics,
               }
-            : next;
+            : entry;
           await processSingleEntry(mergedEntry);
         }
       }
@@ -474,9 +557,142 @@ export function LocalEnrichView({
     }
   };
 
+  const handleSearchMissingLyrics = async () => {
+    const missing = entries.filter((e) => !e.syncedLyrics && !e.plainLyrics && !e.isEnriching);
+    if (missing.length === 0 || isSearchingMissingLyrics) return;
+
+    setIsSearchingMissingLyrics(true);
+    let foundCount = 0;
+    try {
+      const queue = [...missing];
+      const workers = Array.from({ length: Math.min(3, queue.length) }).map(async () => {
+        while (queue.length > 0) {
+          const item = queue.shift();
+          if (!item) break;
+          setEntries((prev) =>
+            prev.map((e) => (e.localId === item.localId ? { ...e, isEnriching: true } : e))
+          );
+          try {
+            const res = await apiFetch('/api/lyrics/search', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                title: item.title,
+                artist: item.artist,
+                album: item.album || undefined,
+                durationSec: item.durationMs > 0 ? Math.round(item.durationMs / 1000) : undefined,
+              }),
+            });
+            const data = (await res.json()) as {
+              found?: boolean;
+              syncedLyrics?: string | null;
+              plainLyrics?: string | null;
+            };
+            if (res.ok && data.found) {
+              foundCount++;
+              setEntries((prev) =>
+                prev.map((e) =>
+                  e.localId === item.localId
+                    ? {
+                        ...e,
+                        syncedLyrics: data.syncedLyrics ?? e.syncedLyrics,
+                        plainLyrics: data.plainLyrics ?? e.plainLyrics,
+                        isEnriching: false,
+                      }
+                    : e
+                )
+              );
+            } else {
+              setEntries((prev) =>
+                prev.map((e) => (e.localId === item.localId ? { ...e, isEnriching: false } : e))
+              );
+            }
+          } catch {
+            setEntries((prev) =>
+              prev.map((e) => (e.localId === item.localId ? { ...e, isEnriching: false } : e))
+            );
+          }
+        }
+      });
+      await Promise.all(workers);
+      showToast(
+        foundCount > 0
+          ? `Đã tự động tìm thêm được lyrics cho ${foundCount}/${missing.length} bài hát.`
+          : 'Không tìm thấy thêm lyrics mới — bạn có thể rút gọn tên bài hát hoặc bấm Tìm lại ở từng dòng.'
+      );
+    } finally {
+      setIsSearchingMissingLyrics(false);
+    }
+  };
+
+  const openLyricsModalFor = (entry: LocalTrackEntry) => {
+    setEditingLyricsId(entry.localId);
+    setModalSearchTitle(entry.title);
+    setModalSearchArtist(entry.artist);
+    setModalSearchNote(null);
+  };
+
+  const handleModalAutoSearchLyrics = async (entry: LocalTrackEntry) => {
+    if (!modalSearchTitle.trim() || isModalSearching) return;
+    setIsModalSearching(true);
+    setModalSearchNote(null);
+    try {
+      const res = await apiFetch('/api/lyrics/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: modalSearchTitle.trim(),
+          artist: modalSearchArtist.trim(),
+          album: entry.album || undefined,
+          durationSec: entry.durationMs > 0 ? Math.round(entry.durationMs / 1000) : undefined,
+        }),
+      });
+      const data = (await res.json()) as {
+        found?: boolean;
+        syncedLyrics?: string | null;
+        plainLyrics?: string | null;
+        source?: string | null;
+        error?: string;
+      };
+      if (res.ok && data.found) {
+        setEntries((prev) =>
+          prev.map((it) =>
+            it.localId === entry.localId
+              ? {
+                  ...it,
+                  syncedLyrics: data.syncedLyrics ?? null,
+                  plainLyrics: data.plainLyrics ?? null,
+                }
+              : it
+          )
+        );
+        const srcLabel =
+          data.source === 'netease' || data.source === 'netease-plain'
+            ? 'NetEase'
+            : data.source === 'lyrics.ovh'
+            ? 'Lyrics.ovh'
+            : 'LRCLIB';
+        setModalSearchNote(
+          data.syncedLyrics
+            ? `Đã tìm thấy LRC Synced từ ${srcLabel}!`
+            : `Đã tìm thấy lời bài hát từ ${srcLabel}!`
+        );
+      } else {
+        setModalSearchNote(
+          data.error || 'Chưa khớp bài này — thử bỏ phần (feat./OST) hoặc kiểm tra lại tên ca sĩ.'
+        );
+      }
+    } catch {
+      setModalSearchNote('Không thể kết nối máy chủ tìm lyrics.');
+    } finally {
+      setIsModalSearching(false);
+    }
+  };
+
   const editingLyricsEntry = entries.find((e) => e.localId === editingLyricsId) || null;
   const editingCoverEntry = entries.find((e) => e.localId === editingCoverId) || null;
   const pendingCount = entries.filter((e) => !e.job || e.job.state === 'error').length;
+  const missingLyricsCount = entries.filter((e) => !e.syncedLyrics && !e.plainLyrics && !e.isEnriching).length;
 
   return (
     <div className="flex-1 flex flex-col min-w-0 w-full">
@@ -504,7 +720,7 @@ export function LocalEnrichView({
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".mp3,.m4a,.wav,.ogg,.flac,.mp4,.webm,.mkv,audio/*,video/*"
+            accept=".mp3,.m4a,.wav,.ogg,.flac,.mp4,.webm,.mkv,.lrc,.txt,audio/*,video/*"
             onChange={(e) => {
               handleFilesSelected(e.target.files);
               e.target.value = '';
@@ -519,7 +735,7 @@ export function LocalEnrichView({
               Kéo thả hàng loạt file MP3 thô vào đây hoặc bấm để chọn file từ máy tính
             </div>
             <div className="text-xs text-slate-400">
-              Đặt tên theo dạng <span className="font-mono text-slate-300">Ca sĩ - Tên bài hát.mp3</span> để nhận diện chính xác Ảnh bìa HD &amp; Lyrics (hỗ trợ cả .m4a, .wav, .mp4).
+              Tự đọc thẻ ID3 gốc, dò đa nguồn (LRCLIB · NetEase · Lyrics.ovh) và hỗ trợ thả kèm file <span className="font-mono text-slate-300">.lrc</span> trùng tên.
             </div>
           </div>
         </div>
@@ -535,6 +751,28 @@ export function LocalEnrichView({
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              {missingLyricsCount > 0 && (
+                <button
+                  type="button"
+                  onClick={handleSearchMissingLyrics}
+                  disabled={isSearchingMissingLyrics}
+                  title="Tự động dò lại lời bài hát cho các bài đang thiếu lyrics"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-white/[0.14] bg-white/[0.05] hover:bg-white/[0.1] disabled:opacity-60 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {isSearchingMissingLyrics ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#1DB954]" />
+                      <span>Đang dò lyrics...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Search className="h-3.5 w-3.5 text-[#1DB954]" />
+                      <span>Tìm lyrics thiếu ({missingLyricsCount})</span>
+                    </>
+                  )}
+                </button>
+              )}
+
               {doneJobs.length > 0 && (
                 <>
                   <button
@@ -737,6 +975,9 @@ export function LocalEnrichView({
                               enrichSingleEntry(entry.localId, {
                                 title: entry.title,
                                 artist: entry.artist,
+                                album: entry.album || undefined,
+                                durationSec:
+                                  entry.durationMs > 0 ? Math.round(entry.durationMs / 1000) : undefined,
                               })
                             }
                             disabled={entry.isEnriching}
@@ -776,10 +1017,10 @@ export function LocalEnrichView({
                         </span>
                         <button
                           type="button"
-                          onClick={() => setEditingLyricsId(entry.localId)}
+                          onClick={() => openLyricsModalFor(entry)}
                           className="px-2 py-1 rounded bg-white/[0.06] hover:bg-white/[0.12] text-xs text-slate-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                         >
-                          {hasLyrics ? 'Xem / Sửa' : 'Thêm tay'}
+                          {hasLyrics ? 'Xem / Sửa' : 'Tìm / Thêm'}
                         </button>
                       </div>
                     </td>
@@ -974,27 +1215,63 @@ export function LocalEnrichView({
           <div className="fixed inset-0 bg-black/80" onClick={() => setEditingLyricsId(null)} aria-hidden="true" />
           <div className="relative z-10 w-full max-w-lg rounded-xl bg-[#111419] border border-white/[0.12] p-5 space-y-4 text-slate-100">
             <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
-              <div>
-                <h3 className="font-display text-sm font-semibold text-white">
+              <div className="min-w-0 pr-3">
+                <h3 className="font-display text-sm font-semibold text-white truncate">
                   {editingLyricsEntry.title} — {editingLyricsEntry.artist || 'Chưa rõ ca sĩ'}
                 </h3>
-                <span className="text-xs text-slate-400">Hỗ trợ LRC có timestamp ([00:12.34]) hoặc lời thường</span>
+                <span className="text-xs text-slate-400">Hỗ trợ tìm tự động đa nguồn, nạp file .LRC/.TXT hoặc dán trực tiếp</span>
               </div>
               <button
                 type="button"
                 onClick={() => setEditingLyricsId(null)}
-                className="p-1 text-slate-400 hover:text-white cursor-pointer"
+                className="p-1 text-slate-400 hover:text-white cursor-pointer shrink-0"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
 
+            {/* Quick In-Modal Lyrics Search */}
+            <div className="rounded-lg bg-[#090B0E] border border-white/[0.08] p-3 space-y-2">
+              <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+                <input
+                  type="text"
+                  value={modalSearchTitle}
+                  onChange={(e) => setModalSearchTitle(e.target.value)}
+                  placeholder="Tên bài hát (ngắn gọn)..."
+                  className="flex-1 min-w-[140px] h-8 rounded bg-[#141920] border border-white/[0.1] px-2.5 text-xs text-white focus:outline-none focus:border-[#1DB954]"
+                />
+                <input
+                  type="text"
+                  value={modalSearchArtist}
+                  onChange={(e) => setModalSearchArtist(e.target.value)}
+                  placeholder="Ca sĩ..."
+                  className="w-32 sm:w-36 shrink-0 h-8 rounded bg-[#141920] border border-white/[0.1] px-2.5 text-xs text-slate-200 focus:outline-none focus:border-[#1DB954]"
+                />
+                <button
+                  type="button"
+                  onClick={() => handleModalAutoSearchLyrics(editingLyricsEntry)}
+                  disabled={isModalSearching || !modalSearchTitle.trim()}
+                  className="h-8 px-3 rounded bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-50 text-[#090B0E] text-xs font-semibold transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  {isModalSearching ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Search className="h-3.5 w-3.5" />
+                  )}
+                  <span>Tìm tự động</span>
+                </button>
+              </div>
+              {modalSearchNote && (
+                <div className="text-[11px] text-[#6ee79c]">{modalSearchNote}</div>
+              )}
+            </div>
+
             <textarea
-              rows={10}
+              rows={9}
               value={editingLyricsEntry.syncedLyrics || editingLyricsEntry.plainLyrics || ''}
               onChange={(e) => {
                 const val = e.target.value;
-                const isLrc = /\[\d{2}:\d{2}/.test(val);
+                const isLrc = /\[\d{1,2}:\d{2}/.test(val);
                 setEntries((prev) =>
                   prev.map((it) =>
                     it.localId === editingLyricsEntry.localId
@@ -1011,14 +1288,66 @@ export function LocalEnrichView({
               className="w-full rounded bg-[#090B0E] border border-white/[0.1] p-3 font-mono text-xs text-slate-200 focus:outline-none focus:border-[#1DB954]"
             />
 
-            <div className="flex justify-end">
-              <button
-                type="button"
-                onClick={() => setEditingLyricsId(null)}
-                className="px-4 py-2 rounded-md bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold cursor-pointer"
-              >
-                Lưu lời bài hát
-              </button>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <input
+                  ref={lrcInputRef}
+                  type="file"
+                  accept=".lrc,.txt,text/plain"
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    e.target.value = '';
+                    if (!f) return;
+                    const text = (await f.text()).trim();
+                    if (!text) return;
+                    const isLrc = /\[\d{1,2}:\d{2}/.test(text);
+                    setEntries((prev) =>
+                      prev.map((it) =>
+                        it.localId === editingLyricsEntry.localId
+                          ? {
+                              ...it,
+                              syncedLyrics: isLrc ? text : null,
+                              plainLyrics: text,
+                            }
+                          : it
+                      )
+                    );
+                    setModalSearchNote(`Đã nạp lời từ file ${f.name}`);
+                  }}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => lrcInputRef.current?.click()}
+                  className="px-3 py-2 rounded-md border border-white/[0.1] bg-white/[0.05] hover:bg-white/[0.1] text-xs text-slate-200 transition-colors cursor-pointer inline-flex items-center gap-1.5"
+                >
+                  <Upload className="h-3.5 w-3.5" />
+                  <span>Nạp file .LRC / .TXT</span>
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {editingLyricsEntry.job?.state === 'done' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const target = entries.find((e) => e.localId === editingLyricsEntry.localId);
+                      setEditingLyricsId(null);
+                      if (target) processSingleEntry(target);
+                    }}
+                    className="px-3 py-2 rounded-md border border-[#1DB954]/45 bg-[#1DB954]/15 hover:bg-[#1DB954]/25 text-[#6ee79c] text-xs font-semibold cursor-pointer"
+                  >
+                    Lưu &amp; Gắn lại MP3
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setEditingLyricsId(null)}
+                  className="px-4 py-2 rounded-md bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold cursor-pointer"
+                >
+                  Lưu lời bài hát
+                </button>
+              </div>
             </div>
           </div>
         </div>
