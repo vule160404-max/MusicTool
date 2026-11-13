@@ -543,11 +543,11 @@ export default function App() {
     }
 
     const base = getBackendBaseUrl();
-    const isFullMp3 = job?.state === 'done' || downloadedTrackIds.has(track.id);
-    const srcUrl =
-      isFullMp3 && job?.jobId
-        ? `${base}/api/download/file/${encodeURIComponent(job.jobId)}?preview=1`
-        : track.previewUrl;
+    const hasFullJobFile = job?.state === 'done' && Boolean(job?.jobId);
+    const isFullMp3 = hasFullJobFile;
+    const srcUrl = hasFullJobFile
+      ? `${base}/api/download/file/${encodeURIComponent(job!.jobId)}?preview=1`
+      : track.previewUrl;
 
     if (!srcUrl) {
       showToast('File MP3 này cần được tải xuống trước khi phát.');

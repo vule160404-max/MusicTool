@@ -30,6 +30,7 @@ const WORKSPACE_DIR = '/tmp/spotflow_downloads';
 const YTDLP_PATH = '/tmp/yt-dlp_linux';
 const YTDLP_RELEASE_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 const FFMPEG_PATH = '/usr/bin/ffmpeg';
+const FFPROBE_PATH = '/usr/bin/ffprobe';
 
 export interface SpotifyTrackItem {
   id: string;
@@ -85,6 +86,9 @@ interface DownloadJob {
   updatedAt: number;
   syncedLyrics?: string | null;
   plainLyrics?: string | null;
+  coverUrl?: string | null;
+  durationMs?: number;
+  spotifyUrl?: string | null;
 }
 
 interface SearchCandidate {
@@ -225,6 +229,38 @@ function normalizeForMatch(input: string): string {
     .replace(/['’"`.,!?()[\]{}:;+~]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function cleanTrackTitleForSearch(title: string): string {
+  const cleaned = title
+    .replace(/\((?:feat\.?|ft\.?|with|explicit|explicit ver\.?|ost[^)]*|from [^)]*|radio edit|single version|remaster(?:ed)?[^)]*)\)/gi, ' ')
+    .replace(/\[(?:feat\.?|ft\.?|ost[^\]]*|from [^\]]*|explicit[^\]]*)\]/gi, ' ')
+    .replace(/\s+-\s+(?:single version|explicit|remastered.*|from .*)$/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || title.trim();
+}
+
+async function probeAudioDurationSec(filePath: string): Promise<number> {
+  try {
+    const res = await runProcessCapture(
+      FFPROBE_PATH,
+      [
+        '-v',
+        'error',
+        '-show_entries',
+        'format=duration',
+        '-of',
+        'default=noprint_wrappers=1:nokey=1',
+        filePath,
+      ],
+      10000
+    );
+    const val = parseFloat(res.stdout.trim());
+    return Number.isFinite(val) ? val : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function sanitizeFileName(name: string): string {
@@ -586,8 +622,10 @@ async function searchBestAudioCandidate(
 ): Promise<SearchCandidate | null> {
   const targetDurationSec = Math.round((durationMs || 0) / 1000);
   const primaryArtist = artist.split(',')[0].trim();
-  const rawQuery = `${primaryArtist} ${title}`.trim();
+  const cleanTitle = cleanTrackTitleForSearch(title);
+  const rawQuery = `${primaryArtist} ${cleanTitle}`.trim();
   const asciiQuery = stripDiacritics(rawQuery);
+  const asciiCleanTitle = stripDiacritics(cleanTitle);
 
   const candidates: SearchCandidate[] = [];
 
@@ -595,12 +633,15 @@ async function searchBestAudioCandidate(
   if (asciiQuery.toLowerCase() !== rawQuery.toLowerCase()) {
     scQueries.push(asciiQuery);
   }
+  if (asciiCleanTitle && asciiCleanTitle.toLowerCase() !== asciiQuery.toLowerCase()) {
+    scQueries.push(asciiCleanTitle);
+  }
 
   for (const q of scQueries) {
     try {
       const res = await runProcessCapture(
         ytdlp,
-        ['--flat-playlist', '--dump-single-json', '--no-warnings', `scsearch12:${q}`],
+        ['--flat-playlist', '--dump-single-json', '--no-warnings', `scsearch15:${q}`],
         20000
       );
       if (res.stdout.trim()) {
@@ -618,7 +659,7 @@ async function searchBestAudioCandidate(
           const entryUrl = entry.webpage_url || entry.url;
           if (!entryUrl || !entry.title) continue;
           const dur = Number(entry.duration) || 0;
-          const sc = scoreAudioCandidate(
+          const scRaw = scoreAudioCandidate(
             entry.title,
             dur,
             entry.uploader || '',
@@ -626,6 +667,17 @@ async function searchBestAudioCandidate(
             artist,
             targetDurationSec
           );
+          const scClean =
+            cleanTitle !== title
+              ? scoreAudioCandidate(
+                  entry.title,
+                  dur,
+                  entry.uploader || '',
+                  cleanTitle,
+                  artist,
+                  targetDurationSec
+                )
+              : scRaw;
           candidates.push({
             id: String(entry.id || entryUrl),
             title: entry.title,
@@ -633,7 +685,7 @@ async function searchBestAudioCandidate(
             duration: dur,
             uploader: entry.uploader || '',
             platform: 'SoundCloud',
-            score: sc,
+            score: Math.max(scRaw, scClean),
           });
         }
       }
@@ -667,7 +719,7 @@ async function searchBestAudioCandidate(
       const [id, durStr, uploader, webpageUrl, ...titleParts] = parts;
       const entryTitle = titleParts.join('\t');
       const dur = Number(durStr) || 0;
-      const sc = scoreAudioCandidate(entryTitle, dur, uploader, title, artist, targetDurationSec);
+      const sc = scoreAudioCandidate(entryTitle, dur, uploader, cleanTitle, artist, targetDurationSec);
       candidates.push({
         id,
         title: entryTitle,
@@ -683,7 +735,7 @@ async function searchBestAudioCandidate(
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  return candidates[0] && candidates[0].score > -100 ? candidates[0] : null;
+  return candidates[0] && candidates[0].score >= 25 ? candidates[0] : null;
 }
 
 async function downloadFileBuffer(url: string): Promise<Buffer | null> {
@@ -711,6 +763,9 @@ async function triggerWebhookNotification(job: DownloadJob, reqHost: string, req
         fileName: job.fileName,
         fileSizeBytes: job.fileSizeBytes,
         downloadUrl: `${reqProtocol}://${reqHost}/api/download/file/${job.jobId}`,
+        coverUrl: job.coverUrl || null,
+        durationMs: job.durationMs || 0,
+        spotifyUrl: job.spotifyUrl || null,
         syncedLyrics: job.syncedLyrics || null,
         plainLyrics: job.plainLyrics || null,
       },
@@ -768,86 +823,76 @@ async function processDownloadJob(
 
     let rawInputPath: string | null = null;
 
-    if (candidate) {
-      job.sourcePlatform = candidate.platform;
-      job.matchedTitle = candidate.title;
-      job.state = 'downloading';
-      job.progress = 18;
-      job.message = `Đang tải stream từ ${candidate.platform}...`;
-      job.updatedAt = Date.now();
+    if (!candidate) {
+      throw new Error(
+        'Không tìm thấy bản audio đầy đủ (Spotify chỉ có đoạn nghe thử 30s). Đã bỏ qua để tránh đồng bộ nhầm bản 30s.'
+      );
+    }
 
-      await new Promise<void>((resolve, reject) => {
-        const proc = spawn(
-          ytdlp,
-          [
-            candidate.url,
-            '-f',
-            'bestaudio/best',
-            '--no-playlist',
-            '--newline',
-            '--no-warnings',
-            '-o',
-            rawDownloadPattern,
-          ],
-          { stdio: ['ignore', 'pipe', 'pipe'] }
-        );
+    job.sourcePlatform = candidate.platform;
+    job.matchedTitle = candidate.title;
+    job.state = 'downloading';
+    job.progress = 18;
+    job.message = `Đang tải bản full từ ${candidate.platform}...`;
+    job.updatedAt = Date.now();
 
-        let errOutput = '';
-        const timer = setTimeout(() => {
-          proc.kill('SIGKILL');
-          reject(new Error('Tải audio quá thời gian cho phép'));
-        }, 90000);
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn(
+        ytdlp,
+        [
+          candidate.url,
+          '-f',
+          'bestaudio/best',
+          '--no-playlist',
+          '--newline',
+          '--no-warnings',
+          '-o',
+          rawDownloadPattern,
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe'] }
+      );
 
-        proc.stdout.on('data', (chunk: Buffer) => {
-          const text = chunk.toString('utf8');
-          const pctMatch = text.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
-          if (pctMatch) {
-            const pct = Math.min(100, Math.max(0, Number(pctMatch[1])));
-            job.progress = Math.round(18 + pct * 0.56);
-            job.updatedAt = Date.now();
-          }
-        });
+      let errOutput = '';
+      const timer = setTimeout(() => {
+        proc.kill('SIGKILL');
+        reject(new Error('Tải audio quá thời gian cho phép'));
+      }, 90000);
 
-        proc.stderr.on('data', (chunk: Buffer) => {
-          errOutput += chunk.toString('utf8');
-        });
-
-        proc.on('error', (err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-
-        proc.on('close', (code) => {
-          clearTimeout(timer);
-          if (code === 0) resolve();
-          else reject(new Error(errOutput.trim() || `Lỗi tải stream (mã ${code})`));
-        });
+      proc.stdout.on('data', (chunk: Buffer) => {
+        const text = chunk.toString('utf8');
+        const pctMatch = text.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
+        if (pctMatch) {
+          const pct = Math.min(100, Math.max(0, Number(pctMatch[1])));
+          job.progress = Math.round(18 + pct * 0.56);
+          job.updatedAt = Date.now();
+        }
       });
 
-      const files = await fsp.readdir(WORKSPACE_DIR);
-      const matchedRaw = files.find((f) => f.startsWith(`${baseSlug}_raw.`));
-      if (matchedRaw) {
-        rawInputPath = path.join(WORKSPACE_DIR, matchedRaw);
-        tempFiles.push(rawInputPath);
-      }
-    } else if (track.previewUrl) {
-      job.sourcePlatform = 'Spotify Preview (30s)';
-      job.matchedTitle = `${track.title} (30s Preview)`;
-      job.state = 'downloading';
-      job.progress = 45;
-      job.message = 'Không tìm thấy bản full, đang tải bản preview Spotify...';
-      job.updatedAt = Date.now();
+      proc.stderr.on('data', (chunk: Buffer) => {
+        errOutput += chunk.toString('utf8');
+      });
 
-      const prevBuf = await downloadFileBuffer(track.previewUrl);
-      if (prevBuf) {
-        rawInputPath = path.join(WORKSPACE_DIR, `${baseSlug}_raw.mp3`);
-        await fsp.writeFile(rawInputPath, prevBuf);
-        tempFiles.push(rawInputPath);
-      }
+      proc.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+
+      proc.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve();
+        else reject(new Error(errOutput.trim() || `Lỗi tải stream (mã ${code})`));
+      });
+    });
+
+    const files = await fsp.readdir(WORKSPACE_DIR);
+    const matchedRaw = files.find((f) => f.startsWith(`${baseSlug}_raw.`));
+    if (matchedRaw) {
+      rawInputPath = path.join(WORKSPACE_DIR, matchedRaw);
+      tempFiles.push(rawInputPath);
     }
 
     if (!rawInputPath) {
-      throw new Error('Không tìm thấy nguồn audio phù hợp cho bài hát này.');
+      throw new Error('Không tìm thấy file audio hợp lệ cho bài hát này.');
     }
 
     job.state = 'converting';
@@ -855,20 +900,21 @@ async function processDownloadJob(
     job.message = `Đang chuyển đổi MP3 ${bitrate}kbps & gắn thẻ ID3/Lyrics...`;
     job.updatedAt = Date.now();
 
-    let coverFilePath: string | null = null;
-    if (embedTags) {
-      const resolvedCoverUrl =
-        track.coverUrl && !track.coverUrl.includes('charts-images')
-          ? track.coverUrl
-          : (await fetchTrackCoverOEmbed(track.spotifyUrl)) || track.coverUrl;
+    const resolvedCoverUrl =
+      track.coverUrl && !track.coverUrl.includes('charts-images')
+        ? track.coverUrl
+        : (await fetchTrackCoverOEmbed(track.spotifyUrl)) || track.coverUrl;
+    if (resolvedCoverUrl) {
+      job.coverUrl = resolvedCoverUrl;
+    }
 
-      if (resolvedCoverUrl) {
-        const coverBuf = await downloadFileBuffer(resolvedCoverUrl);
-        if (coverBuf && coverBuf.length > 500) {
-          coverFilePath = path.join(WORKSPACE_DIR, `${baseSlug}_cover.jpg`);
-          await fsp.writeFile(coverFilePath, coverBuf);
-          tempFiles.push(coverFilePath);
-        }
+    let coverFilePath: string | null = null;
+    if (embedTags && resolvedCoverUrl) {
+      const coverBuf = await downloadFileBuffer(resolvedCoverUrl);
+      if (coverBuf && coverBuf.length > 500) {
+        coverFilePath = path.join(WORKSPACE_DIR, `${baseSlug}_cover.jpg`);
+        await fsp.writeFile(coverFilePath, coverBuf);
+        tempFiles.push(coverFilePath);
       }
     }
 
@@ -926,6 +972,14 @@ async function processDownloadJob(
     const ffRes = await runProcessCapture(FFMPEG_PATH, ffmpegArgs, 60000);
     if (ffRes.code !== 0 || !fs.existsSync(finalMp3Path)) {
       throw new Error('Lỗi chuyển đổi định dạng MP3 bằng FFmpeg.');
+    }
+
+    const actualDurationSec = await probeAudioDurationSec(finalMp3Path);
+    if (targetSec > 75 && actualDurationSec > 0 && actualDurationSec < 45) {
+      await fsp.unlink(finalMp3Path).catch(() => {});
+      throw new Error(
+        `Nguồn audio chỉ trả về đoạn nghe thử ${Math.round(actualDurationSec)}s (Go+/Preview). Đã hủy để tránh đồng bộ nhầm bản cắt.`
+      );
     }
 
     const stat = await fsp.stat(finalMp3Path);
@@ -1021,7 +1075,7 @@ async function startServer() {
 
   app.get('/api/external/tracks', requireApiKey, (req: Request, res: Response) => {
     const host = req.get('host') || 'localhost:3000';
-    const proto = req.protocol;
+    const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
     const completedJobs = Array.from(jobs.values()).filter(
       (j) => j.state === 'done' && j.filePath && fs.existsSync(j.filePath)
     );
@@ -1033,9 +1087,12 @@ async function startServer() {
       artist: j.artist,
       album: j.album,
       bitrate: j.bitrate,
+      durationMs: j.durationMs || 0,
+      spotifyUrl: j.spotifyUrl || null,
       fileName: j.fileName,
       fileSizeBytes: j.fileSizeBytes,
       downloadUrl: `${proto}://${host}/api/download/file/${j.jobId}`,
+      coverUrl: j.coverUrl || null,
       syncedLyrics: j.syncedLyrics || null,
       plainLyrics: j.plainLyrics || null,
       downloadedAt: new Date(j.updatedAt).toISOString(),
@@ -1195,7 +1252,7 @@ async function startServer() {
     const embedTags = body.embedTags !== false;
     const jobId = crypto.randomBytes(8).toString('hex');
     const reqHost = req.get('host') || 'localhost:3000';
-    const reqProtocol = req.protocol;
+    const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
 
     const job: DownloadJob = {
       jobId,
@@ -1217,6 +1274,9 @@ async function startServer() {
       updatedAt: Date.now(),
       syncedLyrics: null,
       plainLyrics: null,
+      coverUrl: body.track.coverUrl || null,
+      durationMs: body.track.durationMs || 0,
+      spotifyUrl: body.track.spotifyUrl || null,
     };
 
     jobs.set(jobId, job);
