@@ -9,6 +9,12 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import {
+  DeleteObjectCommand,
+  HeadBucketCommand,
+  PutObjectCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
 
 interface ArchiverInstance {
   on(event: 'error', listener: (err: Error) => void): this;
@@ -56,6 +62,11 @@ interface DownloadJob {
   webhookMessage?: string | null;
   pushedAt?: string | null;
   sourceFileName?: string | null;
+  r2AudioUrl?: string | null;
+  r2AudioKey?: string | null;
+  r2CoverUrl?: string | null;
+  r2CoverKey?: string | null;
+  storageProvider?: 'spotflow' | 'r2';
 }
 
 interface UploadHistoryItem {
@@ -74,11 +85,21 @@ interface UploadHistoryItem {
 
 type PushConcurrency = 2 | 4 | 6;
 
+interface R2Settings {
+  enabled: boolean;
+  accountId: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  bucketName: string;
+  publicBaseUrl: string;
+}
+
 interface IntegrationSettings {
   apiKey: string;
   webhookUrl: string;
   autoPushWebhook: boolean;
   pushConcurrency: PushConcurrency;
+  r2: R2Settings;
 }
 
 interface ItunesSearchResult {
@@ -98,12 +119,94 @@ const integrationSettings: IntegrationSettings = {
   webhookUrl: '',
   autoPushWebhook: false,
   pushConcurrency: 4,
+  r2: {
+    enabled: Boolean(
+      process.env.R2_ACCOUNT_ID &&
+        process.env.R2_ACCESS_KEY_ID &&
+        process.env.R2_SECRET_ACCESS_KEY &&
+        process.env.R2_BUCKET_NAME &&
+        process.env.R2_PUBLIC_BASE_URL
+    ),
+    accountId: (process.env.R2_ACCOUNT_ID || '').trim(),
+    accessKeyId: (process.env.R2_ACCESS_KEY_ID || '').trim(),
+    secretAccessKey: (process.env.R2_SECRET_ACCESS_KEY || '').trim(),
+    bucketName: (process.env.R2_BUCKET_NAME || '').trim(),
+    publicBaseUrl: (process.env.R2_PUBLIC_BASE_URL || '').trim().replace(/\/+$/, ''),
+  },
 };
 
 function normalizePushConcurrency(val: unknown): PushConcurrency {
   const n = Number(val);
   if (n === 2 || n === 4 || n === 6) return n;
   return 4;
+}
+
+function normalizePublicBaseUrl(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+}
+
+function maskSecret(secret: string): string {
+  const clean = secret.trim();
+  if (!clean) return '';
+  if (clean.length <= 6) return '••••••';
+  return `••••••••${clean.slice(-4)}`;
+}
+
+function toPublicIntegrationSettings() {
+  return {
+    apiKey: integrationSettings.apiKey,
+    webhookUrl: integrationSettings.webhookUrl,
+    autoPushWebhook: integrationSettings.autoPushWebhook,
+    pushConcurrency: integrationSettings.pushConcurrency,
+    r2: {
+      enabled: integrationSettings.r2.enabled,
+      accountId: integrationSettings.r2.accountId,
+      accessKeyId: integrationSettings.r2.accessKeyId,
+      hasSecretKey: Boolean(integrationSettings.r2.secretAccessKey),
+      secretKeyPreview: maskSecret(integrationSettings.r2.secretAccessKey),
+      bucketName: integrationSettings.r2.bucketName,
+      publicBaseUrl: integrationSettings.r2.publicBaseUrl,
+    },
+  };
+}
+
+let cachedR2ClientKey = '';
+let cachedR2Client: S3Client | null = null;
+
+function getR2Client(cfg: R2Settings): S3Client {
+  const key = `${cfg.accountId}|${cfg.accessKeyId}|${cfg.secretAccessKey}`;
+  if (cachedR2Client && cachedR2ClientKey === key) {
+    return cachedR2Client;
+  }
+  cachedR2Client = new S3Client({
+    region: 'auto',
+    endpoint: `https://${cfg.accountId}.r2.cloudflarestorage.com`,
+    credentials: {
+      accessKeyId: cfg.accessKeyId,
+      secretAccessKey: cfg.secretAccessKey,
+    },
+  });
+  cachedR2ClientKey = key;
+  return cachedR2Client;
+}
+
+function validateR2Config(cfg: R2Settings): string | null {
+  if (!cfg.accountId.trim()) return 'Thiếu Cloudflare Account ID trong cấu hình R2.';
+  if (!cfg.accessKeyId.trim()) return 'Thiếu R2 Access Key ID trong cấu hình R2.';
+  if (!cfg.secretAccessKey.trim()) return 'Thiếu R2 Secret Access Key trong cấu hình R2.';
+  if (!cfg.bucketName.trim()) return 'Thiếu tên Bucket R2.';
+  const base = normalizePublicBaseUrl(cfg.publicBaseUrl);
+  if (!base) return 'Thiếu Public Domain URL của R2 (ví dụ https://pub-xxx.r2.dev).';
+  try {
+    const parsed = new URL(base);
+    if (!parsed.hostname) return 'Public Domain URL của R2 không hợp lệ.';
+  } catch {
+    return 'Public Domain URL của R2 không đúng định dạng URL.';
+  }
+  return null;
 }
 
 async function loadIntegrationSettings(): Promise<void> {
@@ -122,6 +225,19 @@ async function loadIntegrationSettings(): Promise<void> {
     }
     if (parsed.pushConcurrency !== undefined) {
       integrationSettings.pushConcurrency = normalizePushConcurrency(parsed.pushConcurrency);
+    }
+    if (parsed.r2 && typeof parsed.r2 === 'object') {
+      const r2 = parsed.r2 as Partial<R2Settings>;
+      if (typeof r2.enabled === 'boolean') integrationSettings.r2.enabled = r2.enabled;
+      if (typeof r2.accountId === 'string') integrationSettings.r2.accountId = r2.accountId.trim();
+      if (typeof r2.accessKeyId === 'string') integrationSettings.r2.accessKeyId = r2.accessKeyId.trim();
+      if (typeof r2.secretAccessKey === 'string' && r2.secretAccessKey.trim()) {
+        integrationSettings.r2.secretAccessKey = r2.secretAccessKey.trim();
+      }
+      if (typeof r2.bucketName === 'string') integrationSettings.r2.bucketName = r2.bucketName.trim();
+      if (typeof r2.publicBaseUrl === 'string') {
+        integrationSettings.r2.publicBaseUrl = normalizePublicBaseUrl(r2.publicBaseUrl);
+      }
     }
   } catch {
     // Ignore malformed file
@@ -1033,6 +1149,85 @@ async function enrichTrackMetadata(input: {
   };
 }
 
+function slugifyR2Segment(input: string): string {
+  const ascii = stripDiacritics(input)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 72);
+  return ascii || 'track';
+}
+
+function detectImageType(buf: Buffer): { ext: string; contentType: string } {
+  if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return { ext: 'png', contentType: 'image/png' };
+  }
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
+    return { ext: 'webp', contentType: 'image/webp' };
+  }
+  return { ext: 'jpg', contentType: 'image/jpeg' };
+}
+
+async function uploadJobToR2(job: DownloadJob): Promise<void> {
+  const r2 = integrationSettings.r2;
+  const errMsg = validateR2Config(r2);
+  if (errMsg) {
+    throw new Error(errMsg);
+  }
+  if (!job.filePath || !fs.existsSync(job.filePath)) {
+    throw new Error('Không tìm thấy file MP3 tạm trên server để tải lên R2.');
+  }
+
+  const client = getR2Client(r2);
+  const publicBase = normalizePublicBaseUrl(r2.publicBaseUrl);
+  const shortId = job.jobId.slice(0, 8);
+  const slug = slugifyR2Segment(`${job.artist ? `${job.artist}-` : ''}${job.title}`);
+
+  const audioTask = (async () => {
+    if (job.r2AudioUrl && job.r2AudioKey) return;
+    const mp3Buffer = await fsp.readFile(job.filePath as string);
+    const audioKey = `tracks/${slug}-${shortId}.mp3`;
+    await client.send(
+      new PutObjectCommand({
+        Bucket: r2.bucketName,
+        Key: audioKey,
+        Body: mp3Buffer,
+        ContentType: 'audio/mpeg',
+        CacheControl: 'public, max-age=31536000, immutable',
+      })
+    );
+    job.r2AudioKey = audioKey;
+    job.r2AudioUrl = `${publicBase}/${audioKey}`;
+  })();
+
+  const coverTask = (async () => {
+    if (!job.coverUrl) return;
+    if (job.r2CoverUrl && job.r2CoverKey) return;
+    if (job.coverUrl.startsWith(`${publicBase}/`)) {
+      job.r2CoverUrl = job.coverUrl;
+      return;
+    }
+    const coverBuf = await downloadFileBuffer(job.coverUrl);
+    if (!coverBuf || coverBuf.length < 400) return;
+    const { ext, contentType } = detectImageType(coverBuf);
+    const coverKey = `covers/${slug}-${shortId}.${ext}`;
+    await client.send(
+      new PutObjectCommand({
+        Bucket: r2.bucketName,
+        Key: coverKey,
+        Body: coverBuf,
+        ContentType: contentType,
+        CacheControl: 'public, max-age=31536000, immutable',
+      })
+    );
+    job.r2CoverKey = coverKey;
+    job.r2CoverUrl = `${publicBase}/${coverKey}`;
+  })();
+
+  await Promise.all([audioTask, coverTask]);
+  job.storageProvider = 'r2';
+}
+
 async function pushJobToWebhook(
   job: DownloadJob,
   reqHost: string,
@@ -1045,13 +1240,27 @@ async function pushJobToWebhook(
   }
 
   job.webhookStatus = 'pushing';
-  job.webhookMessage = 'Đang đẩy bài hát sang App...';
+  job.webhookMessage = integrationSettings.r2.enabled
+    ? 'Đang tải MP3 & ảnh bìa lên Cloudflare R2...'
+    : 'Đang đẩy bài hát sang App...';
   job.updatedAt = Date.now();
 
   try {
+    if (integrationSettings.r2.enabled) {
+      await uploadJobToR2(job);
+      job.webhookMessage = 'Đã lên R2, đang đồng bộ về App Nhạc...';
+      job.updatedAt = Date.now();
+    }
+
+    const fallbackDownloadUrl = `${reqProtocol}://${reqHost}/api/download/file/${job.jobId}`;
+    const finalAudioUrl = job.r2AudioUrl || fallbackDownloadUrl;
+    const finalCoverUrl = job.r2CoverUrl || job.coverUrl || null;
+    const storageMode = job.r2AudioUrl ? 'r2' : 'spotflow';
+
     const payload = {
       event: 'track_downloaded',
       timestamp: new Date().toISOString(),
+      storage: storageMode,
       track: {
         id: job.trackId,
         title: job.title,
@@ -1060,8 +1269,14 @@ async function pushJobToWebhook(
         bitrate: job.bitrate,
         fileName: job.fileName,
         fileSizeBytes: job.fileSizeBytes,
-        downloadUrl: `${reqProtocol}://${reqHost}/api/download/file/${job.jobId}`,
-        coverUrl: job.coverUrl || null,
+        storage: storageMode,
+        downloadUrl: finalAudioUrl,
+        audioUrl: finalAudioUrl,
+        r2AudioUrl: job.r2AudioUrl || null,
+        r2AudioKey: job.r2AudioKey || null,
+        coverUrl: finalCoverUrl,
+        r2CoverUrl: job.r2CoverUrl || null,
+        r2CoverKey: job.r2CoverKey || null,
         durationMs: job.durationMs || 0,
         syncedLyrics: job.syncedLyrics || null,
         plainLyrics: job.plainLyrics || null,
@@ -1080,16 +1295,33 @@ async function pushJobToWebhook(
 
     const respText = await res.text().catch(() => '');
     let parsedMsg = '';
+    let logicalError = false;
     try {
-      const json = JSON.parse(respText) as { message?: string; error?: string };
+      const json = JSON.parse(respText) as {
+        ok?: boolean;
+        success?: boolean;
+        message?: string;
+        error?: string;
+      };
       parsedMsg = json.message || json.error || '';
+      if (
+        json.success === false ||
+        json.ok === false ||
+        (typeof json.error === 'string' && json.error.trim().length > 0)
+      ) {
+        logicalError = true;
+      }
     } catch {
       parsedMsg = respText.slice(0, 140);
     }
 
-    if (res.ok) {
+    if (res.ok && !logicalError) {
       job.webhookStatus = 'pushed';
-      job.webhookMessage = parsedMsg || `Đã đẩy sang App (${res.status})`;
+      job.webhookMessage =
+        parsedMsg ||
+        (job.r2AudioUrl
+          ? `Đã tải thẳng lên R2 & đồng bộ App (${res.status})`
+          : `Đã đẩy sang App (${res.status})`);
       job.pushedAt = new Date().toISOString();
       job.updatedAt = Date.now();
       await upsertUploadHistoryItem({
@@ -1109,9 +1341,9 @@ async function pushJobToWebhook(
       ? `App báo lỗi ${res.status}: ${parsedMsg}`
       : `App phản hồi mã lỗi ${res.status}`;
     job.updatedAt = Date.now();
-    return { success: false, status: res.status, message: job.webhookMessage };
+    return { success: false, status: res.ok ? 422 : res.status, message: job.webhookMessage };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Không thể kết nối tới Webhook URL của App.';
+    const msg = err instanceof Error ? err.message : 'Không thể tải lên R2 hoặc kết nối tới Webhook URL của App.';
     job.webhookStatus = 'error';
     job.webhookMessage = msg;
     job.updatedAt = Date.now();
@@ -1360,7 +1592,7 @@ async function startServer() {
   });
 
   app.get('/api/integration/settings', (_req: Request, res: Response) => {
-    res.json(integrationSettings);
+    res.json(toPublicIntegrationSettings());
   });
 
   app.post('/api/integration/settings', async (req: Request, res: Response) => {
@@ -1369,6 +1601,15 @@ async function startServer() {
       autoPushWebhook?: boolean;
       pushConcurrency?: number;
       regenerateKey?: boolean;
+      r2?: {
+        enabled?: boolean;
+        accountId?: string;
+        accessKeyId?: string;
+        secretAccessKey?: string;
+        clearSecretKey?: boolean;
+        bucketName?: string;
+        publicBaseUrl?: string;
+      };
     };
     if (typeof body.webhookUrl === 'string') {
       integrationSettings.webhookUrl = body.webhookUrl.trim();
@@ -1382,8 +1623,98 @@ async function startServer() {
     if (body.regenerateKey) {
       integrationSettings.apiKey = `sf_live_${crypto.randomBytes(16).toString('hex')}`;
     }
+    if (body.r2 && typeof body.r2 === 'object') {
+      if (typeof body.r2.enabled === 'boolean') {
+        integrationSettings.r2.enabled = body.r2.enabled;
+      }
+      if (typeof body.r2.accountId === 'string') {
+        integrationSettings.r2.accountId = body.r2.accountId.trim();
+      }
+      if (typeof body.r2.accessKeyId === 'string') {
+        integrationSettings.r2.accessKeyId = body.r2.accessKeyId.trim();
+      }
+      if (body.r2.clearSecretKey) {
+        integrationSettings.r2.secretAccessKey = '';
+      } else if (typeof body.r2.secretAccessKey === 'string' && body.r2.secretAccessKey.trim()) {
+        integrationSettings.r2.secretAccessKey = body.r2.secretAccessKey.trim();
+      }
+      if (typeof body.r2.bucketName === 'string') {
+        integrationSettings.r2.bucketName = body.r2.bucketName.trim();
+      }
+      if (typeof body.r2.publicBaseUrl === 'string') {
+        integrationSettings.r2.publicBaseUrl = normalizePublicBaseUrl(body.r2.publicBaseUrl);
+      }
+    }
     await saveIntegrationSettings();
-    res.json(integrationSettings);
+    res.json(toPublicIntegrationSettings());
+  });
+
+  app.post('/api/integration/r2-test', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as {
+      accountId?: string;
+      accessKeyId?: string;
+      secretAccessKey?: string;
+      bucketName?: string;
+      publicBaseUrl?: string;
+    };
+
+    const testCfg: R2Settings = {
+      enabled: true,
+      accountId: (body.accountId ?? integrationSettings.r2.accountId).trim(),
+      accessKeyId: (body.accessKeyId ?? integrationSettings.r2.accessKeyId).trim(),
+      secretAccessKey:
+        typeof body.secretAccessKey === 'string' && body.secretAccessKey.trim()
+          ? body.secretAccessKey.trim()
+          : integrationSettings.r2.secretAccessKey,
+      bucketName: (body.bucketName ?? integrationSettings.r2.bucketName).trim(),
+      publicBaseUrl: normalizePublicBaseUrl(
+        body.publicBaseUrl ?? integrationSettings.r2.publicBaseUrl
+      ),
+    };
+
+    const errMsg = validateR2Config(testCfg);
+    if (errMsg) {
+      res.status(400).json({ success: false, message: errMsg });
+      return;
+    }
+
+    try {
+      const client = new S3Client({
+        region: 'auto',
+        endpoint: `https://${testCfg.accountId}.r2.cloudflarestorage.com`,
+        credentials: {
+          accessKeyId: testCfg.accessKeyId,
+          secretAccessKey: testCfg.secretAccessKey,
+        },
+      });
+      await client.send(new HeadBucketCommand({ Bucket: testCfg.bucketName }));
+      const testKey = `_spotflow_test/ping-${Date.now()}.txt`;
+      await client.send(
+        new PutObjectCommand({
+          Bucket: testCfg.bucketName,
+          Key: testKey,
+          Body: Buffer.from('spotflow-r2-ok', 'utf8'),
+          ContentType: 'text/plain',
+        })
+      );
+      await client.send(
+        new DeleteObjectCommand({
+          Bucket: testCfg.bucketName,
+          Key: testKey,
+        })
+      );
+
+      res.json({
+        success: true,
+        message: `Kết nối Bucket "${testCfg.bucketName}" thành công (đã kiểm tra quyền đọc/ghi/xóa)!`,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Không thể kết nối tới Cloudflare R2.';
+      res.status(500).json({
+        success: false,
+        message: `Lỗi kết nối R2: ${msg}`,
+      });
+    }
   });
 
   const requireApiKey = (req: Request, res: Response, next: () => void) => {

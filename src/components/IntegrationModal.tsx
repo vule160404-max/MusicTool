@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import {
   Check,
   Copy,
-  ExternalLink,
+  HardDrive,
   Key,
   Loader2,
   RefreshCw,
@@ -38,14 +38,26 @@ export function IntegrationModal({
     webhookUrl: '',
     autoPushWebhook: false,
     pushConcurrency: 4,
+    r2: {
+      enabled: false,
+      accountId: '',
+      accessKeyId: '',
+      hasSecretKey: false,
+      secretKeyPreview: '',
+      bucketName: '',
+      publicBaseUrl: '',
+    },
   });
+  const [r2SecretInput, setR2SecretInput] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [isTesting, setIsTesting] = useState<boolean>(false);
+  const [isTestingR2, setIsTestingR2] = useState<boolean>(false);
   const [isPushingAll, setIsPushingAll] = useState<boolean>(false);
   const [pushProgress, setPushProgress] = useState<{ done: number; total: number } | null>(null);
   const [pushingJobIds, setPushingJobIds] = useState<Set<string>>(new Set());
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [r2TestResult, setR2TestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState<boolean>(false);
   const [copiedEndpoint, setCopiedEndpoint] = useState<boolean>(false);
   const [copiedEnrichEndpoint, setCopiedEnrichEndpoint] = useState<boolean>(false);
@@ -57,39 +69,34 @@ export function IntegrationModal({
   const apiEndpointUrl = `${originBase}/api/external/tracks`;
   const enrichEndpointUrl = `${originBase}/api/external/enrich`;
 
-  const r2PromptText = `Hãy thiết kế chức năng Upload file MP3 lên App Nhạc và tự động tìm Ảnh Bìa + Lyrics để lưu lên Cloudflare R2 như sau:
+  const r2PromptText = `Hãy cập nhật endpoint Webhook POST /api/webhooks/spotflow trên App Nhạc để nhận bài hát do SpotFlow tải thẳng lên Cloudflare R2 (tránh tải/upload lặp lại qua Vercel):
 
-1. Khi người dùng chọn/upload 1 hoặc nhiều file .mp3 lên App (file gốc chưa có ảnh bìa và lyrics):
-   - Trước khi lưu lên Cloudflare R2, gọi API làm giàu dữ liệu của SpotFlow:
-     POST ${enrichEndpointUrl}
-     Headers: { "Content-Type": "application/json", "X-API-Key": "${config.apiKey || '<API_KEY>'}" }
-     Body: { "fileName": file.name, "title": parsedTitle, "artist": parsedArtist }
+1. Xác thực header X-API-Key: "${config.apiKey || '<API_KEY>'}"
 
-2. API trả về JSON:
-   {
-     "matched": true,
-     "track": {
-       "title": "Tên bài hát chuẩn",
-       "artist": "Ca sĩ",
-       "album": "Album",
-       "durationMs": 240000,
-       "coverUrl": "https://...jpg",
-       "syncedLyrics": "[00:12.34] ...",
-       "plainLyrics": "..."
-     }
-   }
+2. Khi nhận body JSON { event: "track_downloaded", storage, track }:
+   - Nếu track.storage === "r2" hoặc có sẵn track.r2AudioUrl:
+     * KHÔNG cần tải lại file từ downloadUrl hay upload lại lên R2 (vì SpotFlow đã đẩy sẵn file vào tracks/... và covers/... trên R2).
+     * Dùng trực tiếp:
+       - audioUrl = track.r2AudioUrl || track.audioUrl
+       - coverUrl = track.r2CoverUrl || track.coverUrl || null
+       - r2AudioKey = track.r2AudioKey (lưu nếu DB quản lý key để xóa file sau này)
+       - r2CoverKey = track.r2CoverKey
+     * Ghi thẳng 1 bản ghi bài hát mới (title, artist, album, durationMs, audioUrl, coverUrl, syncedLyrics, plainLyrics) vào Database của App Nhạc và trả về HTTP 200 { "ok": true }.
+   - Nếu có lỗi lưu Database hoặc thiếu audioUrl: PHẢI trả về mã lỗi HTTP 4xx/5xx (hoặc { "ok": false, "error": "..." }) thay vì { "ok": true }.
 
-3. Upload lên Cloudflare R2:
-   - Upload file .mp3 lên R2 (ví dụ key: tracks/<slug>-<timestamp>.mp3, Content-Type: audio/mpeg) -> lấy r2AudioUrl.
-   - Nếu track.coverUrl có dữ liệu: server/worker tải ảnh từ track.coverUrl rồi upload lên R2 (key: covers/<slug>-<timestamp>.jpg, Content-Type: image/jpeg) -> lấy r2CoverUrl.
-   - Lưu vào Database của App Nhạc: title, artist, album, durationMs, audioUrl: r2AudioUrl, coverUrl: r2CoverUrl, syncedLyrics, plainLyrics (lưu dạng text/LRC trong DB hoặc file .lrc trên R2).
-   - Ngoài ra, tạo thêm endpoint Webhook POST /api/webhooks/spotflow (xác thực header X-API-Key) để khi tôi xử lý file từ SpotFlow đẩy sang, App tự tải track.downloadUrl & track.coverUrl rồi lưu thẳng lên Cloudflare R2 tương tự.`;
+3. Fallback cho luồng cũ (khi track.storage !== "r2"):
+   - Tải MP3 từ track.downloadUrl & ảnh từ track.coverUrl rồi upload lên R2 (tracks/<slug>-<timestamp>.mp3, covers/<slug>-<timestamp>.jpg) trước khi ghi DB.
+
+4. (Tùy chọn) API làm giàu metadata khi upload trực tiếp trên App Nhạc:
+   - POST ${enrichEndpointUrl} (Header X-API-Key) với { fileName, title, artist } để lấy coverUrl, syncedLyrics, plainLyrics.`;
 
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     (async () => {
       setIsLoading(true);
+      setR2SecretInput('');
+      setR2TestResult(null);
       try {
         const res = await apiFetch('/api/integration/settings');
         if (!res.ok) return;
@@ -109,9 +116,22 @@ export function IntegrationModal({
     };
   }, [isOpen, onSettingsSaved]);
 
-  const handleSaveSettings = async (regenerate = false, overrideConcurrency?: 2 | 4 | 6) => {
+  const handleSaveSettings = async (
+    regenerate = false,
+    overrideConcurrency?: 2 | 4 | 6,
+    clearR2Secret = false
+  ) => {
     setIsSaving(true);
     const nextConcurrency = overrideConcurrency || config.pushConcurrency || 4;
+    const r2State = config.r2 || {
+      enabled: false,
+      accountId: '',
+      accessKeyId: '',
+      hasSecretKey: false,
+      secretKeyPreview: '',
+      bucketName: '',
+      publicBaseUrl: '',
+    };
     try {
       const res = await apiFetch('/api/integration/settings', {
         method: 'POST',
@@ -121,19 +141,70 @@ export function IntegrationModal({
           autoPushWebhook: config.autoPushWebhook,
           pushConcurrency: nextConcurrency,
           regenerateKey: regenerate,
+          r2: {
+            enabled: r2State.enabled,
+            accountId: r2State.accountId,
+            accessKeyId: r2State.accessKeyId,
+            bucketName: r2State.bucketName,
+            publicBaseUrl: r2State.publicBaseUrl,
+            ...(clearR2Secret
+              ? { clearSecretKey: true }
+              : r2SecretInput.trim()
+              ? { secretAccessKey: r2SecretInput.trim() }
+              : {}),
+          },
         }),
       });
       if (!res.ok) throw new Error('Không thể lưu cài đặt.');
       const data = (await res.json()) as IntegrationConfig;
       setConfig(data);
+      setR2SecretInput('');
       onSettingsSaved?.(data);
       if (!overrideConcurrency) {
-        showToast(regenerate ? 'Đã tạo mới API Key thành công!' : 'Đã lưu cấu hình liên kết app nhạc.');
+        showToast(
+          regenerate
+            ? 'Đã tạo mới API Key thành công!'
+            : clearR2Secret
+            ? 'Đã xóa R2 Secret Key khỏi cấu hình.'
+            : 'Đã lưu cấu hình R2 & Liên kết App Nhạc.'
+        );
       }
     } catch {
       showToast('Lỗi khi lưu cấu hình.');
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const handleTestR2 = async () => {
+    const r2State = config.r2;
+    if (!r2State) return;
+    setIsTestingR2(true);
+    setR2TestResult(null);
+    try {
+      const res = await apiFetch('/api/integration/r2-test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accountId: r2State.accountId,
+          accessKeyId: r2State.accessKeyId,
+          ...(r2SecretInput.trim() ? { secretAccessKey: r2SecretInput.trim() } : {}),
+          bucketName: r2State.bucketName,
+          publicBaseUrl: r2State.publicBaseUrl,
+        }),
+      });
+      const data = (await res.json()) as { success?: boolean; message?: string };
+      setR2TestResult({
+        success: Boolean(data.success),
+        message: data.message || (res.ok ? 'Kết nối R2 thành công!' : 'Lỗi kết nối R2.'),
+      });
+    } catch (err) {
+      setR2TestResult({
+        success: false,
+        message: err instanceof Error ? err.message : 'Không thể kiểm tra kết nối R2.',
+      });
+    } finally {
+      setIsTestingR2(false);
     }
   };
 
@@ -339,116 +410,211 @@ export function IntegrationModal({
             <Loader2 className="h-8 w-8 animate-spin text-[#1DB954]" />
           </div>
         ) : (
-          <div className="space-y-6">
-            {/* Step 1: API Endpoint & Key */}
-            <div className="space-y-3 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954] flex items-center gap-1.5">
-                  <Key className="h-3.5 w-3.5" />
-                  <span>1. API Endpoint &amp; Khóa Bảo Mật (API Key)</span>
-                </span>
+          <div className="space-y-5">
+            {/* Step 1: Cloudflare R2 Direct Upload */}
+            <div className="space-y-3.5 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954] flex items-center gap-1.5">
+                    <HardDrive className="h-3.5 w-3.5" />
+                    <span>1. Tải thẳng lên Cloudflare R2 (Khuyên dùng)</span>
+                  </span>
+                  <p className="text-xs text-slate-400 mt-1">
+                    SpotFlow tải trực tiếp MP3 &amp; ảnh bìa lên R2 (<code className="text-slate-300">tracks/</code> và <code className="text-slate-300">covers/</code>), bỏ bước trung gian qua Vercel.
+                  </p>
+                </div>
+
                 <button
                   type="button"
-                  onClick={() => handleSaveSettings(true)}
-                  disabled={isSaving}
-                  className="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-white transition-colors cursor-pointer"
+                  role="switch"
+                  aria-checked={Boolean(config.r2?.enabled)}
+                  aria-label="Bật tải thẳng lên Cloudflare R2"
+                  onClick={() =>
+                    setConfig((prev) => ({
+                      ...prev,
+                      r2: {
+                        enabled: !prev.r2?.enabled,
+                        accountId: prev.r2?.accountId || '',
+                        accessKeyId: prev.r2?.accessKeyId || '',
+                        hasSecretKey: Boolean(prev.r2?.hasSecretKey),
+                        secretKeyPreview: prev.r2?.secretKeyPreview || '',
+                        bucketName: prev.r2?.bucketName || '',
+                        publicBaseUrl: prev.r2?.publicBaseUrl || '',
+                      },
+                    }))
+                  }
+                  className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1DB954] ${
+                    config.r2?.enabled ? 'bg-[#1DB954]' : 'bg-slate-700'
+                  }`}
                 >
-                  <RefreshCw className="h-3 w-3" />
-                  <span>Tạo khóa mới</span>
+                  <span
+                    className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      config.r2?.enabled ? 'translate-x-4' : 'translate-x-0'
+                    }`}
+                  />
                 </button>
               </div>
 
-              <div className="space-y-2">
-                <label className="block text-xs text-slate-400">REST API Endpoint cho app nhạc của bạn</label>
-                <div className="flex items-center gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label htmlFor="r2-account-id" className="block text-xs text-slate-400">
+                    Cloudflare Account ID
+                  </label>
                   <input
+                    id="r2-account-id"
                     type="text"
-                    readOnly
-                    value={apiEndpointUrl}
-                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
+                    value={config.r2?.accountId || ''}
+                    onChange={(e) =>
+                      setConfig((prev) => ({
+                        ...prev,
+                        r2: { ...(prev.r2 || { enabled: true, accountId: '', accessKeyId: '', hasSecretKey: false, secretKeyPreview: '', bucketName: '', publicBaseUrl: '' }), accountId: e.target.value },
+                      }))
+                    }
+                    placeholder="32 ký tự hex Account ID"
+                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-[#1DB954]"
                   />
-                  <button
-                    type="button"
-                    onClick={() => copyToClipboard(apiEndpointUrl, 'endpoint')}
-                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
-                  >
-                    {copiedEndpoint ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
-                    <span>{copiedEndpoint ? 'Đã chép' : 'Sao chép'}</span>
-                  </button>
                 </div>
-              </div>
 
-              <div className="space-y-2">
-                <label className="block text-xs text-slate-400">
-                  API Tìm Ảnh Bìa &amp; Lyrics từ tên file MP3 (<code className="text-[#1DB954]">POST</code> cho luồng Upload R2)
-                </label>
-                <div className="flex items-center gap-2">
+                <div className="space-y-1">
+                  <label htmlFor="r2-bucket-name" className="block text-xs text-slate-400">
+                    Tên Bucket R2
+                  </label>
                   <input
+                    id="r2-bucket-name"
                     type="text"
-                    readOnly
-                    value={enrichEndpointUrl}
-                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
+                    value={config.r2?.bucketName || ''}
+                    onChange={(e) =>
+                      setConfig((prev) => ({
+                        ...prev,
+                        r2: { ...(prev.r2 || { enabled: true, accountId: '', accessKeyId: '', hasSecretKey: false, secretKeyPreview: '', bucketName: '', publicBaseUrl: '' }), bucketName: e.target.value },
+                      }))
+                    }
+                    placeholder="vd: soundly-music"
+                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-[#1DB954]"
                   />
-                  <button
-                    type="button"
-                    onClick={() => copyToClipboard(enrichEndpointUrl, 'enrich')}
-                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
-                  >
-                    {copiedEnrichEndpoint ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
-                    <span>{copiedEnrichEndpoint ? 'Đã chép' : 'Sao chép'}</span>
-                  </button>
                 </div>
-              </div>
 
-              <div className="space-y-2">
-                <label className="block text-xs text-slate-400">API Key bảo mật (truyền qua Header <code className="text-[#1DB954]">X-API-Key</code>)</label>
-                <div className="flex items-center gap-2">
+                <div className="space-y-1">
+                  <label htmlFor="r2-access-key" className="block text-xs text-slate-400">
+                    R2 Access Key ID
+                  </label>
                   <input
+                    id="r2-access-key"
+                    type="text"
+                    value={config.r2?.accessKeyId || ''}
+                    onChange={(e) =>
+                      setConfig((prev) => ({
+                        ...prev,
+                        r2: { ...(prev.r2 || { enabled: true, accountId: '', accessKeyId: '', hasSecretKey: false, secretKeyPreview: '', bucketName: '', publicBaseUrl: '' }), accessKeyId: e.target.value },
+                      }))
+                    }
+                    placeholder="Access Key ID của R2 API Token"
+                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-[#1DB954]"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <label htmlFor="r2-secret-key" className="block text-xs text-slate-400">
+                      R2 Secret Access Key
+                    </label>
+                    {config.r2?.hasSecretKey && (
+                      <button
+                        type="button"
+                        onClick={() => handleSaveSettings(false, undefined, true)}
+                        disabled={isSaving}
+                        className="text-[11px] text-slate-400 hover:text-red-400 transition-colors cursor-pointer"
+                      >
+                        Xóa khóa đã lưu
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    id="r2-secret-key"
                     type="password"
-                    readOnly
-                    value={config.apiKey}
-                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
+                    value={r2SecretInput}
+                    onChange={(e) => setR2SecretInput(e.target.value)}
+                    placeholder={
+                      config.r2?.hasSecretKey
+                        ? `Đã lưu (${config.r2.secretKeyPreview}) — nhập mới để đổi`
+                        : 'Secret Access Key (chỉ lưu tại server)'
+                    }
+                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-white placeholder:text-slate-500 focus:outline-none focus:border-[#1DB954]"
                   />
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label htmlFor="r2-public-url" className="block text-xs text-slate-400">
+                  Public Domain URL của Bucket R2 (link phát nhạc công khai)
+                </label>
+                <input
+                  id="r2-public-url"
+                  type="url"
+                  value={config.r2?.publicBaseUrl || ''}
+                  onChange={(e) =>
+                    setConfig((prev) => ({
+                      ...prev,
+                      r2: { ...(prev.r2 || { enabled: true, accountId: '', accessKeyId: '', hasSecretKey: false, secretKeyPreview: '', bucketName: '', publicBaseUrl: '' }), publicBaseUrl: e.target.value },
+                    }))
+                  }
+                  placeholder="https://pub-xxxxxxxx.r2.dev hoặc https://cdn.appnhaccuaban.com"
+                  className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-[#1DB954]"
+                />
+              </div>
+
+              {r2TestResult && (
+                <div
+                  className={`text-xs p-2.5 rounded border ${
+                    r2TestResult.success
+                      ? 'bg-[#1DB954]/10 border-[#1DB954]/30 text-[#6ee79c]'
+                      : 'bg-red-500/10 border-red-500/30 text-red-400'
+                  }`}
+                >
+                  {r2TestResult.message}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                <span className="text-[11px] text-slate-500">
+                  Quy chuẩn key: <span className="font-mono text-slate-300">tracks/&lt;slug&gt;-&lt;id&gt;.mp3</span> ·{' '}
+                  <span className="font-mono text-slate-300">covers/&lt;slug&gt;-&lt;id&gt;.jpg</span>
+                </span>
+                <div className="flex items-center gap-2 shrink-0">
                   <button
                     type="button"
-                    onClick={() => copyToClipboard(config.apiKey, 'key')}
-                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                    onClick={handleTestR2}
+                    disabled={isTestingR2}
+                    className="h-8 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] disabled:opacity-45 text-xs font-medium text-white transition-colors cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap"
                   >
-                    {copiedKey ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
-                    <span>{copiedKey ? 'Đã chép' : 'Sao chép'}</span>
+                    {isTestingR2 ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#1DB954]" />
+                    ) : (
+                      <HardDrive className="h-3.5 w-3.5 text-[#1DB954]" />
+                    )}
+                    <span>Kiểm tra kết nối R2</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSaveSettings(false)}
+                    disabled={isSaving}
+                    className="h-8 px-3.5 rounded bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-50 text-[#090B0E] text-xs font-semibold transition-colors cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {isSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    <span>Lưu cấu hình R2</span>
                   </button>
                 </div>
               </div>
-            </div>
-
-            {/* R2 Prompt Box */}
-            <div className="space-y-2.5 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954]">
-                  Lệnh / Prompt tạo tính năng lưu Ảnh + Lyrics lên Cloudflare R2 bên App Nhạc
-                </span>
-                <button
-                  type="button"
-                  onClick={() => copyToClipboard(r2PromptText, 'prompt')}
-                  className="px-3 py-1.5 rounded bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
-                >
-                  {copiedPrompt ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                  <span>{copiedPrompt ? 'Đã chép Prompt' : 'Sao chép Prompt'}</span>
-                </button>
-              </div>
-              <pre className="max-h-36 overflow-y-auto rounded bg-[#141920] border border-white/[0.08] p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">
-                {r2PromptText}
-              </pre>
             </div>
 
             {/* Step 2: Webhook URL & Auto Push */}
             <div className="space-y-3 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
               <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954] flex items-center gap-1.5">
                 <Send className="h-3.5 w-3.5" />
-                <span>2. Webhook Tự Động Đẩy Bài Hát Sang App Nhạc</span>
+                <span>2. Webhook Ghi Bài Hát Sang App Nhạc</span>
               </span>
               <p className="text-xs text-slate-400">
-                Mỗi khi SpotFlow xử lý xong file MP3 kèm ảnh bìa và lyrics, hệ thống sẽ tự động gọi HTTP POST tới URL của bạn (hoặc dùng nút Đẩy sang App thủ công bên dưới).
+                Sau khi SpotFlow tải file lên R2 xong (hoặc khi tắt R2), hệ thống gọi HTTP POST tới URL dưới đây để App Nhạc lưu metadata &amp; lyrics vào Database.
               </p>
 
               <div className="space-y-2">
@@ -489,7 +655,7 @@ export function IntegrationModal({
               <div className="flex items-center justify-between pt-1">
                 <div>
                   <div className="text-xs font-medium text-slate-200">Tự động đẩy khi xử lý xong</div>
-                  <div className="text-xs text-slate-500">Tự động gọi webhook ngay khi hoàn tất gắn ảnh bìa &amp; lyrics</div>
+                  <div className="text-xs text-slate-500">Tự động tải lên R2 và gọi webhook ngay khi gắn thẻ xong</div>
                 </div>
                 <button
                   type="button"
@@ -511,7 +677,7 @@ export function IntegrationModal({
               <div className="space-y-2 pt-1 border-t border-white/[0.06]">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <div className="text-xs font-medium text-slate-200">Tốc độ đẩy song song lên App</div>
+                    <div className="text-xs font-medium text-slate-200">Tốc độ đẩy song song lên R2 &amp; App</div>
                     <div className="text-xs text-slate-500">
                       Chạy nhiều luồng cùng lúc giúp đẩy 40–50 bài nhanh hơn 4–6 lần
                     </div>
@@ -554,12 +720,112 @@ export function IntegrationModal({
               </div>
             </div>
 
-            {/* Step 3: Processed Tracks & Manual Push */}
+            {/* Step 3: API Endpoint, Key & Prompt */}
+            <div className="space-y-3 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954] flex items-center gap-1.5">
+                  <Key className="h-3.5 w-3.5" />
+                  <span>3. API Endpoint, Khóa Bảo Mật &amp; Prompt cập nhật App Nhạc</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleSaveSettings(true)}
+                  disabled={isSaving}
+                  className="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-white transition-colors cursor-pointer"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  <span>Tạo khóa mới</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <label className="block text-xs text-slate-400">REST API Endpoint danh sách bài</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      readOnly
+                      value={apiEndpointUrl}
+                      className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(apiEndpointUrl, 'endpoint')}
+                      className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                    >
+                      {copiedEndpoint ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
+                      <span>{copiedEndpoint ? 'Đã chép' : 'Chép'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs text-slate-400">API Tìm Ảnh Bìa &amp; Lyrics (<code className="text-[#1DB954]">POST</code>)</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      readOnly
+                      value={enrichEndpointUrl}
+                      className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(enrichEndpointUrl, 'enrich')}
+                      className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                    >
+                      {copiedEnrichEndpoint ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
+                      <span>{copiedEnrichEndpoint ? 'Đã chép' : 'Chép'}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block text-xs text-slate-400">API Key bảo mật (Header <code className="text-[#1DB954]">X-API-Key</code>)</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="password"
+                    readOnly
+                    value={config.apiKey}
+                    className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-slate-200 select-all"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(config.apiKey, 'key')}
+                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                  >
+                    {copiedKey ? <Check className="h-3.5 w-3.5 text-[#1DB954]" /> : <Copy className="h-3.5 w-3.5" />}
+                    <span>{copiedKey ? 'Đã chép' : 'Sao chép'}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2 pt-2 border-t border-white/[0.06]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-200">
+                    Prompt cập nhật Webhook bên App Nhạc (nhận link R2 trực tiếp, tránh trùng &amp; tải lại)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(r2PromptText, 'prompt')}
+                    className="px-3 py-1.5 rounded bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                  >
+                    {copiedPrompt ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                    <span>{copiedPrompt ? 'Đã chép Prompt' : 'Sao chép Prompt'}</span>
+                  </button>
+                </div>
+                <pre className="max-h-36 overflow-y-auto rounded bg-[#141920] border border-white/[0.08] p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">
+                  {r2PromptText}
+                </pre>
+              </div>
+            </div>
+
+            {/* Step 4: Processed Tracks & Manual Push */}
             <div className="space-y-3 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954] flex items-center gap-1.5">
                   <Sparkles className="h-3.5 w-3.5" />
-                  <span>3. Bài hát đã xử lý &amp; Đẩy sang App ({completedJobs.length})</span>
+                  <span>4. Bài hát đã xử lý &amp; Đẩy sang App ({completedJobs.length})</span>
                 </span>
                 {completedJobs.length > 0 && (
                   <button
@@ -580,7 +846,7 @@ export function IntegrationModal({
                     ) : (
                       <>
                         <Send className="h-3.5 w-3.5" />
-                        <span>Đẩy tất cả sang App</span>
+                        <span>{config.r2?.enabled ? 'Đẩy tất cả lên R2 & App' : 'Đẩy tất cả sang App'}</span>
                       </>
                     )}
                   </button>
@@ -589,7 +855,7 @@ export function IntegrationModal({
 
               {completedJobs.length === 0 ? (
                 <p className="text-xs text-slate-400 py-2">
-                  Chưa có bài hát nào được xử lý xong trong phiên này. Hãy kéo thả file MP3 và bấm &quot;Xử lý &amp; Gắn thẻ&quot; để chuẩn bị bài hát đẩy sang App.
+                  Chưa có bài hát nào được xử lý xong trong phiên này. Hãy kéo thả file MP3 và bấm &quot;Xử lý &amp; Gắn thẻ&quot; để chuẩn bị bài hát đẩy sang R2 &amp; App.
                 </p>
               ) : (
                 <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
@@ -605,7 +871,12 @@ export function IntegrationModal({
                           <div className="text-slate-400 truncate flex items-center gap-2">
                             <span className="truncate">{j.artist}</span>
                             {j.webhookStatus === 'pushed' && (
-                              <span className="text-[#1DB954] shrink-0">· Đã đẩy sang App</span>
+                              <span
+                                title={j.webhookMessage || ''}
+                                className="text-[#1DB954] shrink-0"
+                              >
+                                · {j.r2AudioUrl || j.storageProvider === 'r2' ? 'Đã lên R2 & App' : 'Đã đẩy sang App'}
+                              </span>
                             )}
                             {j.webhookStatus === 'error' && (
                               <span

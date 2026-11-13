@@ -49,6 +49,7 @@ interface LocalEnrichViewProps {
   skipDuplicates: boolean;
   webhookUrl: string;
   pushConcurrency: 2 | 4 | 6;
+  r2Enabled: boolean;
   completedJobs: DownloadJob[];
   historyItems: UploadHistoryItem[];
   playingLocalId: string | null;
@@ -102,6 +103,7 @@ export function LocalEnrichView({
   skipDuplicates,
   webhookUrl,
   pushConcurrency,
+  r2Enabled,
   completedJobs,
   historyItems,
   playingLocalId,
@@ -153,7 +155,9 @@ export function LocalEnrichView({
           latest &&
           (latest.webhookStatus !== e.job.webhookStatus ||
             latest.webhookMessage !== e.job.webhookMessage ||
-            latest.pushedAt !== e.job.pushedAt)
+            latest.pushedAt !== e.job.pushedAt ||
+            latest.r2AudioUrl !== e.job.r2AudioUrl ||
+            latest.storageProvider !== e.job.storageProvider)
         ) {
           changed = true;
           return { ...e, job: latest };
@@ -1014,7 +1018,7 @@ export function LocalEnrichView({
                     ) : (
                       <>
                         <Send className="h-3.5 w-3.5" />
-                        <span>Đẩy sang App ({doneJobs.length})</span>
+                        <span>{r2Enabled ? `Đẩy lên R2 & App (${doneJobs.length})` : `Đẩy sang App (${doneJobs.length})`}</span>
                       </>
                     )}
                   </button>
@@ -1319,7 +1323,7 @@ export function LocalEnrichView({
                               title={job.webhookMessage || 'Đã đẩy sang App Nhạc'}
                               className="text-xs text-[#1DB954] whitespace-nowrap"
                             >
-                              Đã đẩy
+                              {job.r2AudioUrl || job.storageProvider === 'r2' ? 'Đã lên R2' : 'Đã đẩy'}
                             </span>
                           ) : job.webhookStatus === 'error' ? (
                             <span

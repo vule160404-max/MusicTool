@@ -24,6 +24,21 @@ export interface DownloadJob {
   webhookStatus?: 'idle' | 'pushing' | 'pushed' | 'error';
   webhookMessage?: string | null;
   pushedAt?: string | null;
+  r2AudioUrl?: string | null;
+  r2AudioKey?: string | null;
+  r2CoverUrl?: string | null;
+  r2CoverKey?: string | null;
+  storageProvider?: 'spotflow' | 'r2';
+}
+
+export interface R2PublicConfig {
+  enabled: boolean;
+  accountId: string;
+  accessKeyId: string;
+  hasSecretKey: boolean;
+  secretKeyPreview: string;
+  bucketName: string;
+  publicBaseUrl: string;
 }
 
 export interface IntegrationConfig {
@@ -31,6 +46,7 @@ export interface IntegrationConfig {
   webhookUrl: string;
   autoPushWebhook: boolean;
   pushConcurrency?: 2 | 4 | 6;
+  r2?: R2PublicConfig;
 }
 
 export interface EnrichedMetadata {

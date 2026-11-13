@@ -436,6 +436,7 @@ export default function App() {
             skipDuplicates={skipDuplicates}
             webhookUrl={integrationConfig.webhookUrl}
             pushConcurrency={integrationConfig.pushConcurrency || 4}
+            r2Enabled={Boolean(integrationConfig.r2?.enabled)}
             completedJobs={completedJobs}
             historyItems={historyItems}
             playingLocalId={playingEntry?.localId || null}
