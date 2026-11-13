@@ -30,6 +30,7 @@ export interface IntegrationConfig {
   apiKey: string;
   webhookUrl: string;
   autoPushWebhook: boolean;
+  pushConcurrency?: 2 | 4 | 6;
 }
 
 export interface EnrichedMetadata {

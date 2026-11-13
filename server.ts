@@ -72,10 +72,13 @@ interface UploadHistoryItem {
   pushedAt?: string | null;
 }
 
+type PushConcurrency = 2 | 4 | 6;
+
 interface IntegrationSettings {
   apiKey: string;
   webhookUrl: string;
   autoPushWebhook: boolean;
+  pushConcurrency: PushConcurrency;
 }
 
 interface ItunesSearchResult {
@@ -94,7 +97,14 @@ const integrationSettings: IntegrationSettings = {
   apiKey: `sf_live_${crypto.randomBytes(16).toString('hex')}`,
   webhookUrl: '',
   autoPushWebhook: false,
+  pushConcurrency: 4,
 };
+
+function normalizePushConcurrency(val: unknown): PushConcurrency {
+  const n = Number(val);
+  if (n === 2 || n === 4 || n === 6) return n;
+  return 4;
+}
 
 async function loadIntegrationSettings(): Promise<void> {
   try {
@@ -109,6 +119,9 @@ async function loadIntegrationSettings(): Promise<void> {
     }
     if (typeof parsed.autoPushWebhook === 'boolean') {
       integrationSettings.autoPushWebhook = parsed.autoPushWebhook;
+    }
+    if (parsed.pushConcurrency !== undefined) {
+      integrationSettings.pushConcurrency = normalizePushConcurrency(parsed.pushConcurrency);
     }
   } catch {
     // Ignore malformed file
@@ -137,13 +150,31 @@ async function loadUploadHistory(): Promise<void> {
   }
 }
 
+let historyWriteChain: Promise<void> = Promise.resolve();
+let historyWriteTimer: ReturnType<typeof setTimeout> | null = null;
+
 async function saveUploadHistory(): Promise<void> {
-  try {
-    await ensureWorkspace();
-    await fsp.writeFile(UPLOAD_HISTORY_FILE, JSON.stringify(uploadHistory.slice(0, 2000), null, 2), 'utf8');
-  } catch {
-    // Ignore disk write error
+  if (historyWriteTimer) {
+    clearTimeout(historyWriteTimer);
+    historyWriteTimer = null;
   }
+  historyWriteChain = historyWriteChain
+    .then(async () => {
+      await ensureWorkspace();
+      await fsp.writeFile(UPLOAD_HISTORY_FILE, JSON.stringify(uploadHistory.slice(0, 2000), null, 2), 'utf8');
+    })
+    .catch(() => {
+      // Ignore disk write error
+    });
+  await historyWriteChain;
+}
+
+function scheduleSaveUploadHistory(): void {
+  if (historyWriteTimer) return;
+  historyWriteTimer = setTimeout(() => {
+    historyWriteTimer = null;
+    saveUploadHistory().catch(() => {});
+  }, 200);
 }
 
 async function ensureWorkspace(): Promise<void> {
@@ -314,7 +345,7 @@ async function upsertUploadHistoryItem(input: {
     };
     uploadHistory.splice(existingIdx, 1);
     uploadHistory.unshift(updated);
-    await saveUploadHistory();
+    scheduleSaveUploadHistory();
     return updated;
   }
 
@@ -335,7 +366,7 @@ async function upsertUploadHistoryItem(input: {
   if (uploadHistory.length > 2000) {
     uploadHistory = uploadHistory.slice(0, 2000);
   }
-  await saveUploadHistory();
+  scheduleSaveUploadHistory();
   return created;
 }
 
@@ -1118,6 +1149,10 @@ async function processLocalUploadJob(
     job.message = 'Đang tải ảnh bìa & nhúng ID3/Lyrics...';
     job.updatedAt = Date.now();
 
+    // Download cover art concurrently with audio probing whenever coverUrl is already known
+    const prefetchedCoverPromise: Promise<Buffer | null> | null =
+      embedTags && job.coverUrl ? downloadFileBuffer(job.coverUrl) : null;
+
     const probedSec = await probeAudioDurationSec(rawInputPath);
     if (probedSec > 0) {
       job.durationMs = Math.round(probedSec * 1000);
@@ -1153,7 +1188,9 @@ async function processLocalUploadJob(
 
     let coverFilePath: string | null = null;
     if (embedTags && job.coverUrl) {
-      const coverBuf = await downloadFileBuffer(job.coverUrl);
+      const coverBuf = prefetchedCoverPromise
+        ? await prefetchedCoverPromise
+        : await downloadFileBuffer(job.coverUrl);
       if (coverBuf && coverBuf.length > 500) {
         coverFilePath = path.join(WORKSPACE_DIR, `${job.jobId}_cover.jpg`);
         await fsp.writeFile(coverFilePath, coverBuf);
@@ -1327,12 +1364,20 @@ async function startServer() {
   });
 
   app.post('/api/integration/settings', async (req: Request, res: Response) => {
-    const body = req.body as { webhookUrl?: string; autoPushWebhook?: boolean; regenerateKey?: boolean };
+    const body = req.body as {
+      webhookUrl?: string;
+      autoPushWebhook?: boolean;
+      pushConcurrency?: number;
+      regenerateKey?: boolean;
+    };
     if (typeof body.webhookUrl === 'string') {
       integrationSettings.webhookUrl = body.webhookUrl.trim();
     }
     if (typeof body.autoPushWebhook === 'boolean') {
       integrationSettings.autoPushWebhook = body.autoPushWebhook;
+    }
+    if (body.pushConcurrency !== undefined) {
+      integrationSettings.pushConcurrency = normalizePushConcurrency(body.pushConcurrency);
     }
     if (body.regenerateKey) {
       integrationSettings.apiKey = `sf_live_${crypto.randomBytes(16).toString('hex')}`;
@@ -1564,9 +1609,9 @@ async function startServer() {
     res.json({ jobId, job });
   });
 
-  // Push completed tracks directly to the configured Music App Webhook
+  // Push completed tracks directly to the configured Music App Webhook (concurrent worker pool)
   app.post('/api/local/push', async (req: Request, res: Response) => {
-    const body = req.body as { jobIds?: string[]; webhookUrl?: string };
+    const body = req.body as { jobIds?: string[]; webhookUrl?: string; concurrency?: number };
     const targetUrl = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
     if (!targetUrl) {
       res.status(400).json({ error: 'Chưa cấu hình Webhook URL trong Liên kết App Nhạc.' });
@@ -1586,17 +1631,36 @@ async function startServer() {
     const reqHost = req.get('host') || 'localhost:3000';
     const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
 
-    const results: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }> = [];
+    const requestedConcurrency = Number(body.concurrency || integrationSettings.pushConcurrency || 4);
+    const workerCount = Math.min(
+      Math.max(1, Number.isFinite(requestedConcurrency) ? Math.min(8, requestedConcurrency) : 4),
+      targetJobs.length
+    );
+
+    const results: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }> = new Array(
+      targetJobs.length
+    );
     const updatedJobs: Record<string, DownloadJob> = {};
 
-    for (const job of targetJobs) {
-      const outcome = await pushJobToWebhook(job, reqHost, reqProtocol, targetUrl);
-      results.push({
-        jobId: job.jobId,
-        title: job.title,
-        ...outcome,
-      });
-      updatedJobs[job.jobId] = { ...job, filePath: null };
+    let cursor = 0;
+    const workers = Array.from({ length: workerCount }).map(async () => {
+      while (cursor < targetJobs.length) {
+        const index = cursor++;
+        const job = targetJobs[index];
+        const outcome = await pushJobToWebhook(job, reqHost, reqProtocol, targetUrl);
+        results[index] = {
+          jobId: job.jobId,
+          title: job.title,
+          ...outcome,
+        };
+        updatedJobs[job.jobId] = { ...job, filePath: null };
+      }
+    });
+
+    await Promise.all(workers);
+
+    if (targetJobs.length > 1) {
+      await saveUploadHistory();
     }
 
     const pushedCount = results.filter((r) => r.success).length;

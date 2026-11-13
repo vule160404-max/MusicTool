@@ -42,6 +42,7 @@ export default function App() {
     apiKey: '',
     webhookUrl: '',
     autoPushWebhook: false,
+    pushConcurrency: 4,
   });
   const [stats, setStats] = useState<{ totalEntries: number; doneCount: number; totalSizeMb: string }>({
     totalEntries: 0,
@@ -203,31 +204,15 @@ export default function App() {
     }
   }, [loadIntegrationSettings, syncUploadHistory]);
 
-  const handleJobsUpdated = useCallback(
-    (newJobs: DownloadJob[]) => {
-      setCompletedJobs((prev) => {
-        const map = new Map(prev.map((j) => [j.jobId, j]));
-        for (const j of newJobs) {
-          if (j.state === 'done') map.set(j.jobId, j);
-        }
-        return Array.from(map.values());
-      });
-      const pushed = newJobs.filter((j) => j.state === 'done' && j.webhookStatus === 'pushed');
-      if (pushed.length > 0) {
-        recordHistoryItems(
-          pushed.map((j) => ({
-            title: j.title,
-            artist: j.artist,
-            album: j.album,
-            fileName: j.fileName || `${j.artist} - ${j.title}.mp3`,
-            fileSizeBytes: j.fileSizeBytes,
-            pushedToApp: true,
-          }))
-        ).catch(() => {});
+  const handleJobsUpdated = useCallback((newJobs: DownloadJob[]) => {
+    setCompletedJobs((prev) => {
+      const map = new Map(prev.map((j) => [j.jobId, j]));
+      for (const j of newJobs) {
+        if (j.state === 'done') map.set(j.jobId, j);
       }
-    },
-    [recordHistoryItems]
-  );
+      return Array.from(map.values());
+    });
+  }, []);
 
   useEffect(() => {
     refreshBackendStatus();
@@ -450,6 +435,7 @@ export default function App() {
             autoDownloadEach={autoDownloadEach}
             skipDuplicates={skipDuplicates}
             webhookUrl={integrationConfig.webhookUrl}
+            pushConcurrency={integrationConfig.pushConcurrency || 4}
             completedJobs={completedJobs}
             historyItems={historyItems}
             playingLocalId={playingEntry?.localId || null}
@@ -460,7 +446,7 @@ export default function App() {
             onOpenHistoryModal={() => setIsHistoryModalOpen(true)}
             onStatsChange={setStats}
             onJobsUpdated={handleJobsUpdated}
-            onRecordHistory={recordHistoryItems}
+            onSyncHistory={syncUploadHistory}
           />
         </main>
 
@@ -499,6 +485,7 @@ export default function App() {
           showToast={showToast}
           onSettingsSaved={setIntegrationConfig}
           onJobsUpdated={handleJobsUpdated}
+          onSyncHistory={syncUploadHistory}
         />
 
         <HistoryModal

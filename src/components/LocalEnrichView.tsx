@@ -48,6 +48,7 @@ interface LocalEnrichViewProps {
   autoDownloadEach: boolean;
   skipDuplicates: boolean;
   webhookUrl: string;
+  pushConcurrency: 2 | 4 | 6;
   completedJobs: DownloadJob[];
   historyItems: UploadHistoryItem[];
   playingLocalId: string | null;
@@ -58,16 +59,7 @@ interface LocalEnrichViewProps {
   onOpenHistoryModal: () => void;
   onStatsChange: (stats: { totalEntries: number; doneCount: number; totalSizeMb: string }) => void;
   onJobsUpdated: (jobs: DownloadJob[]) => void;
-  onRecordHistory: (
-    items: Array<{
-      title: string;
-      artist: string;
-      album?: string;
-      fileName: string;
-      fileSizeBytes?: number | null;
-      pushedToApp?: boolean;
-    }>
-  ) => Promise<void>;
+  onSyncHistory: () => Promise<void>;
 }
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -109,6 +101,7 @@ export function LocalEnrichView({
   autoDownloadEach,
   skipDuplicates,
   webhookUrl,
+  pushConcurrency,
   completedJobs,
   historyItems,
   playingLocalId,
@@ -119,7 +112,7 @@ export function LocalEnrichView({
   onOpenHistoryModal,
   onStatsChange,
   onJobsUpdated,
-  onRecordHistory,
+  onSyncHistory,
 }: LocalEnrichViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const lrcInputRef = useRef<HTMLInputElement | null>(null);
@@ -130,6 +123,7 @@ export function LocalEnrichView({
   const [isProcessingAll, setIsProcessingAll] = useState<boolean>(false);
   const [isZipping, setIsZipping] = useState<boolean>(false);
   const [isPushingAll, setIsPushingAll] = useState<boolean>(false);
+  const [pushProgress, setPushProgress] = useState<{ done: number; total: number } | null>(null);
   const [isSearchingMissingLyrics, setIsSearchingMissingLyrics] = useState<boolean>(false);
   const [pushingJobIds, setPushingJobIds] = useState<Set<string>>(new Set());
   const [editingLyricsId, setEditingLyricsId] = useState<string | null>(null);
@@ -241,8 +235,8 @@ export function LocalEnrichView({
   };
 
   const pollJobUntilDone = async (localId: string, jobId: string): Promise<DownloadJob | null> => {
-    for (let i = 0; i < 60; i++) {
-      await new Promise((r) => setTimeout(r, 650));
+    for (let i = 0; i < 160; i++) {
+      await new Promise((r) => setTimeout(r, i < 4 ? 180 : 280));
       try {
         const res = await apiFetch(`/api/download/status/${encodeURIComponent(jobId)}`);
         if (!res.ok) continue;
@@ -275,7 +269,10 @@ export function LocalEnrichView({
     return null;
   };
 
-  const processSingleEntry = async (entry: LocalTrackEntry): Promise<DownloadJob | null> => {
+  const processSingleEntry = async (
+    entry: LocalTrackEntry,
+    syncHistoryAfter = true
+  ): Promise<DownloadJob | null> => {
     try {
       const prepRes = await apiFetch('/api/local/prepare', {
         method: 'POST',
@@ -317,17 +314,8 @@ export function LocalEnrichView({
       const finalJob = await pollJobUntilDone(entry.localId, prepData.jobId);
       if (finalJob) {
         onJobsUpdated([finalJob]);
-        if (finalJob.state === 'done') {
-          onRecordHistory([
-            {
-              title: finalJob.title,
-              artist: finalJob.artist,
-              album: finalJob.album,
-              fileName: entry.fileName || finalJob.fileName || `${finalJob.title}.mp3`,
-              fileSizeBytes: finalJob.fileSizeBytes,
-              pushedToApp: finalJob.webhookStatus === 'pushed',
-            },
-          ]).catch(() => {});
+        if (finalJob.state === 'done' && syncHistoryAfter) {
+          onSyncHistory().catch(() => {});
         }
       }
       return finalJob;
@@ -508,7 +496,7 @@ export function LocalEnrichView({
     setEntries((prev) => [...prev, ...acceptedItems.map((c) => c.entry)]);
 
     const queue = [...acceptedItems];
-    const workers = Array.from({ length: Math.min(3, queue.length) }).map(async () => {
+    const workers = Array.from({ length: Math.min(4, queue.length) }).map(async () => {
       while (queue.length > 0) {
         const next = queue.shift();
         if (!next) break;
@@ -533,11 +521,14 @@ export function LocalEnrichView({
                 plainLyrics: enriched.plainLyrics ?? entry.plainLyrics,
               }
             : entry;
-          await processSingleEntry(mergedEntry);
+          await processSingleEntry(mergedEntry, false);
         }
       }
     });
     await Promise.all(workers);
+    if (autoProcessOnUpload) {
+      onSyncHistory().catch(() => {});
+    }
   };
 
   const handleProcessAll = async () => {
@@ -548,16 +539,17 @@ export function LocalEnrichView({
     let doneCount = 0;
     try {
       const queue = [...targets];
-      const workers = Array.from({ length: Math.min(2, queue.length) }).map(async () => {
+      const workers = Array.from({ length: Math.min(4, queue.length) }).map(async () => {
         while (queue.length > 0) {
           const item = queue.shift();
           if (!item) break;
-          const result = await processSingleEntry(item);
+          const result = await processSingleEntry(item, false);
           if (result?.state === 'done') doneCount++;
         }
       });
       await Promise.all(workers);
       if (doneCount > 0) {
+        onSyncHistory().catch(() => {});
         showToast(`Đã gắn ảnh bìa & lyrics hoàn tất ${doneCount} bài hát.`);
       }
     } finally {
@@ -606,73 +598,103 @@ export function LocalEnrichView({
     }
 
     const targetIds = validTargets.map((j) => j.jobId);
-    if (!singleMode) setIsPushingAll(true);
+    if (!singleMode) {
+      setIsPushingAll(true);
+      setPushProgress({ done: 0, total: validTargets.length });
+    }
     setPushingJobIds((prev) => {
       const next = new Set(prev);
       targetIds.forEach((id) => next.add(id));
       return next;
     });
 
+    let pushedCount = 0;
+    let failedCount = 0;
+    let completedCount = 0;
+    let firstFail = '';
+
     try {
-      const res = await apiFetch('/api/local/push', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobIds: targetIds,
-          webhookUrl: webhookUrl.trim(),
-        }),
-      });
-      const data = (await res.json()) as {
-        total?: number;
-        pushedCount?: number;
-        failedCount?: number;
-        results?: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }>;
-        jobs?: Record<string, DownloadJob>;
-        error?: string;
-      };
+      const concurrency = Math.min(pushConcurrency || 4, validTargets.length);
+      const queue = [...validTargets];
 
-      if (!res.ok) {
-        showToast(data.error || 'Không thể đẩy bài hát sang App Nhạc.');
-        return;
-      }
+      const workers = Array.from({ length: concurrency }).map(async () => {
+        while (queue.length > 0) {
+          const job = queue.shift();
+          if (!job) break;
+          try {
+            const res = await apiFetch('/api/local/push', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jobIds: [job.jobId],
+                webhookUrl: webhookUrl.trim(),
+              }),
+            });
+            const data = (await res.json()) as {
+              pushedCount?: number;
+              failedCount?: number;
+              results?: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }>;
+              jobs?: Record<string, DownloadJob>;
+              error?: string;
+            };
 
-      if (data.jobs) {
-        const updatedMap = data.jobs;
-        setEntries((prev) =>
-          prev.map((e) => (e.job && updatedMap[e.job.jobId] ? { ...e, job: updatedMap[e.job.jobId] } : e))
-        );
-        const updatedList = Object.values(updatedMap);
-        onJobsUpdated(updatedList);
-        const pushedList = updatedList.filter((j) => j.webhookStatus === 'pushed');
-        if (pushedList.length > 0) {
-          onRecordHistory(
-            pushedList.map((j) => ({
-              title: j.title,
-              artist: j.artist,
-              album: j.album,
-              fileName: j.fileName || `${j.artist} - ${j.title}.mp3`,
-              fileSizeBytes: j.fileSizeBytes,
-              pushedToApp: true,
-            }))
-          ).catch(() => {});
+            if (!res.ok) {
+              failedCount++;
+              if (!firstFail) firstFail = data.error || 'Lỗi đẩy bài hát';
+            } else {
+              if (data.jobs) {
+                const updatedMap = data.jobs;
+                setEntries((prev) =>
+                  prev.map((e) => (e.job && updatedMap[e.job.jobId] ? { ...e, job: updatedMap[e.job.jobId] } : e))
+                );
+                onJobsUpdated(Object.values(updatedMap));
+              }
+              const ok = (data.pushedCount || 0) > 0;
+              if (ok) {
+                pushedCount++;
+              } else {
+                failedCount++;
+                const msg = data.results?.[0]?.message || data.error || '';
+                if (!firstFail && msg) firstFail = msg;
+              }
+            }
+          } catch (err) {
+            failedCount++;
+            if (!firstFail && err instanceof Error) firstFail = err.message;
+          } finally {
+            completedCount++;
+            if (!singleMode) {
+              setPushProgress({ done: completedCount, total: validTargets.length });
+            }
+            setPushingJobIds((prev) => {
+              const next = new Set(prev);
+              next.delete(job.jobId);
+              return next;
+            });
+          }
         }
-      }
+      });
 
-      const pushedCount = data.pushedCount || 0;
-      const failedCount = data.failedCount || 0;
-      const firstFail = data.results?.find((r) => !r.success)?.message || '';
+      await Promise.all(workers);
+
+      if (pushedCount > 0) {
+        onSyncHistory().catch(() => {});
+      }
 
       if (failedCount === 0) {
         showToast(`Đã đẩy ${pushedCount} bài hát (kèm ảnh bìa & lyrics) sang App Nhạc thành công!`);
       } else if (pushedCount > 0) {
-        showToast(`Đã đẩy ${pushedCount}/${data.total || targetIds.length} bài thành công, ${failedCount} bài lỗi (${firstFail}).`);
+        showToast(
+          `Đã đẩy ${pushedCount}/${validTargets.length} bài thành công, ${failedCount} bài lỗi (${firstFail || 'Kiểm tra Webhook'}).`
+        );
       } else {
         showToast(`Đẩy sang App thất bại: ${firstFail || 'Kiểm tra lại Webhook URL của App.'}`);
       }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Lỗi kết nối khi đẩy sang App.');
     } finally {
-      if (!singleMode) setIsPushingAll(false);
+      if (!singleMode) {
+        setIsPushingAll(false);
+        setPushProgress(null);
+      }
       setPushingJobIds((prev) => {
         const next = new Set(prev);
         targetIds.forEach((id) => next.delete(id));
@@ -973,6 +995,7 @@ export function LocalEnrichView({
                     type="button"
                     onClick={() => handlePushJobs(doneJobs, false)}
                     disabled={isPushingAll}
+                    title={`Đẩy song song ${pushConcurrency || 4} luồng (có thể đổi trong Liên kết App Nhạc)`}
                     className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 ${
                       pendingCount === 0
                         ? 'bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E]'
@@ -982,7 +1005,11 @@ export function LocalEnrichView({
                     {isPushingAll ? (
                       <>
                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        <span>Đang đẩy...</span>
+                        <span>
+                          {pushProgress
+                            ? `Đang đẩy ${pushProgress.done}/${pushProgress.total}...`
+                            : 'Đang đẩy...'}
+                        </span>
                       </>
                     ) : (
                       <>

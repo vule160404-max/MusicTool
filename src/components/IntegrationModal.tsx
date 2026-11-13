@@ -21,6 +21,7 @@ interface IntegrationModalProps {
   showToast: (msg: string) => void;
   onSettingsSaved?: (config: IntegrationConfig) => void;
   onJobsUpdated?: (jobs: DownloadJob[]) => void;
+  onSyncHistory?: () => Promise<void>;
 }
 
 export function IntegrationModal({
@@ -30,16 +31,19 @@ export function IntegrationModal({
   showToast,
   onSettingsSaved,
   onJobsUpdated,
+  onSyncHistory,
 }: IntegrationModalProps) {
   const [config, setConfig] = useState<IntegrationConfig>({
     apiKey: '',
     webhookUrl: '',
     autoPushWebhook: false,
+    pushConcurrency: 4,
   });
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [isTesting, setIsTesting] = useState<boolean>(false);
   const [isPushingAll, setIsPushingAll] = useState<boolean>(false);
+  const [pushProgress, setPushProgress] = useState<{ done: number; total: number } | null>(null);
   const [pushingJobIds, setPushingJobIds] = useState<Set<string>>(new Set());
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState<boolean>(false);
@@ -105,8 +109,9 @@ export function IntegrationModal({
     };
   }, [isOpen, onSettingsSaved]);
 
-  const handleSaveSettings = async (regenerate = false) => {
+  const handleSaveSettings = async (regenerate = false, overrideConcurrency?: 2 | 4 | 6) => {
     setIsSaving(true);
+    const nextConcurrency = overrideConcurrency || config.pushConcurrency || 4;
     try {
       const res = await apiFetch('/api/integration/settings', {
         method: 'POST',
@@ -114,6 +119,7 @@ export function IntegrationModal({
         body: JSON.stringify({
           webhookUrl: config.webhookUrl,
           autoPushWebhook: config.autoPushWebhook,
+          pushConcurrency: nextConcurrency,
           regenerateKey: regenerate,
         }),
       });
@@ -121,7 +127,9 @@ export function IntegrationModal({
       const data = (await res.json()) as IntegrationConfig;
       setConfig(data);
       onSettingsSaved?.(data);
-      showToast(regenerate ? 'Đã tạo mới API Key thành công!' : 'Đã lưu cấu hình liên kết app nhạc.');
+      if (!overrideConcurrency) {
+        showToast(regenerate ? 'Đã tạo mới API Key thành công!' : 'Đã lưu cấu hình liên kết app nhạc.');
+      }
     } catch {
       showToast('Lỗi khi lưu cấu hình.');
     } finally {
@@ -169,55 +177,99 @@ export function IntegrationModal({
     if (targetJobs.length === 0) return;
 
     const targetIds = targetJobs.map((j) => j.jobId);
-    if (!singleMode) setIsPushingAll(true);
+    if (!singleMode) {
+      setIsPushingAll(true);
+      setPushProgress({ done: 0, total: targetJobs.length });
+    }
     setPushingJobIds((prev) => {
       const next = new Set(prev);
       targetIds.forEach((id) => next.add(id));
       return next;
     });
 
+    let pushedCount = 0;
+    let failedCount = 0;
+    let completedCount = 0;
+    let firstFail = '';
+
     try {
-      const res = await apiFetch('/api/local/push', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobIds: targetIds,
-          webhookUrl: targetUrl,
-        }),
+      const concurrency = Math.min(config.pushConcurrency || 4, targetJobs.length);
+      const queue = [...targetJobs];
+
+      const workers = Array.from({ length: concurrency }).map(async () => {
+        while (queue.length > 0) {
+          const job = queue.shift();
+          if (!job) break;
+          try {
+            const res = await apiFetch('/api/local/push', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jobIds: [job.jobId],
+                webhookUrl: targetUrl,
+              }),
+            });
+            const data = (await res.json()) as {
+              pushedCount?: number;
+              failedCount?: number;
+              results?: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }>;
+              jobs?: Record<string, DownloadJob>;
+              error?: string;
+            };
+
+            if (!res.ok) {
+              failedCount++;
+              if (!firstFail) firstFail = data.error || 'Lỗi đẩy bài hát';
+            } else {
+              if (data.jobs && onJobsUpdated) {
+                onJobsUpdated(Object.values(data.jobs));
+              }
+              const ok = (data.pushedCount || 0) > 0;
+              if (ok) {
+                pushedCount++;
+              } else {
+                failedCount++;
+                const msg = data.results?.[0]?.message || data.error || '';
+                if (!firstFail && msg) firstFail = msg;
+              }
+            }
+          } catch (err) {
+            failedCount++;
+            if (!firstFail && err instanceof Error) firstFail = err.message;
+          } finally {
+            completedCount++;
+            if (!singleMode) {
+              setPushProgress({ done: completedCount, total: targetJobs.length });
+            }
+            setPushingJobIds((prev) => {
+              const next = new Set(prev);
+              next.delete(job.jobId);
+              return next;
+            });
+          }
+        }
       });
-      const data = (await res.json()) as {
-        total?: number;
-        pushedCount?: number;
-        failedCount?: number;
-        results?: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }>;
-        jobs?: Record<string, DownloadJob>;
-        error?: string;
-      };
 
-      if (!res.ok) {
-        showToast(data.error || 'Không thể đẩy bài hát sang App.');
-        return;
+      await Promise.all(workers);
+
+      if (pushedCount > 0) {
+        onSyncHistory?.().catch(() => {});
       }
-
-      if (data.jobs && onJobsUpdated) {
-        onJobsUpdated(Object.values(data.jobs));
-      }
-
-      const pushedCount = data.pushedCount || 0;
-      const failedCount = data.failedCount || 0;
-      const firstFail = data.results?.find((r) => !r.success)?.message || '';
 
       if (failedCount === 0) {
         showToast(`Đã đẩy ${pushedCount} bài hát sang App Nhạc thành công!`);
       } else if (pushedCount > 0) {
-        showToast(`Đã đẩy ${pushedCount}/${data.total || targetIds.length} bài thành công, ${failedCount} bài lỗi (${firstFail}).`);
+        showToast(
+          `Đã đẩy ${pushedCount}/${targetJobs.length} bài thành công, ${failedCount} bài lỗi (${firstFail || 'Kiểm tra Webhook'}).`
+        );
       } else {
         showToast(`Đẩy sang App thất bại: ${firstFail || 'Kiểm tra lại Webhook URL.'}`);
       }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Lỗi kết nối webhook khi đẩy bài hát.');
     } finally {
-      if (!singleMode) setIsPushingAll(false);
+      if (!singleMode) {
+        setIsPushingAll(false);
+        setPushProgress(null);
+      }
       setPushingJobIds((prev) => {
         const next = new Set(prev);
         targetIds.forEach((id) => next.delete(id));
@@ -456,6 +508,39 @@ export function IntegrationModal({
                 </button>
               </div>
 
+              <div className="space-y-2 pt-1 border-t border-white/[0.06]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-medium text-slate-200">Tốc độ đẩy song song lên App</div>
+                    <div className="text-xs text-slate-500">
+                      Chạy nhiều luồng cùng lúc giúp đẩy 40–50 bài nhanh hơn 4–6 lần
+                    </div>
+                  </div>
+                  <div className="inline-flex rounded-md bg-[#141920] p-0.5 border border-white/[0.08]">
+                    {([2, 4, 6] as const).map((val) => {
+                      const active = (config.pushConcurrency || 4) === val;
+                      return (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => {
+                            setConfig((prev) => ({ ...prev, pushConcurrency: val }));
+                            handleSaveSettings(false, val);
+                          }}
+                          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                            active
+                              ? 'bg-[#1DB954] text-[#090B0E] font-semibold'
+                              : 'text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          {val} luồng{val === 4 ? ' (Khuyên dùng)' : val === 6 ? ' (Tối đa)' : ''}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
               <div className="pt-2 flex justify-end">
                 <button
                   type="button"
@@ -486,7 +571,11 @@ export function IntegrationModal({
                     {isPushingAll ? (
                       <>
                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        <span>Đang đẩy...</span>
+                        <span>
+                          {pushProgress
+                            ? `Đang đẩy ${pushProgress.done}/${pushProgress.total}...`
+                            : 'Đang đẩy...'}
+                        </span>
                       </>
                     ) : (
                       <>
