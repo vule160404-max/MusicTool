@@ -21,6 +21,9 @@ export interface DownloadJob {
   durationMs?: number;
   syncedLyrics?: string | null;
   plainLyrics?: string | null;
+  webhookStatus?: 'idle' | 'pushing' | 'pushed' | 'error';
+  webhookMessage?: string | null;
+  pushedAt?: string | null;
 }
 
 export interface IntegrationConfig {

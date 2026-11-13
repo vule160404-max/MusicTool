@@ -5,8 +5,8 @@ import { LocalEnrichView } from './components/LocalEnrichView';
 import { AudioPlayerDock } from './components/AudioPlayerDock';
 import { IntegrationModal } from './components/IntegrationModal';
 import { BackendConnectionModal } from './components/BackendConnectionModal';
-import { checkBackendStatus, getBackendBaseUrl } from './utils/api';
-import type { AudioBitrate, DownloadJob, LocalTrackEntry } from './types';
+import { apiFetch, checkBackendStatus, getBackendBaseUrl } from './utils/api';
+import type { AudioBitrate, DownloadJob, IntegrationConfig, LocalTrackEntry } from './types';
 
 export default function App() {
   const [bitrate, setBitrate] = useState<AudioBitrate>(320);
@@ -15,6 +15,11 @@ export default function App() {
   const [autoDownloadEach, setAutoDownloadEach] = useState<boolean>(false);
 
   const [completedJobs, setCompletedJobs] = useState<DownloadJob[]>([]);
+  const [integrationConfig, setIntegrationConfig] = useState<IntegrationConfig>({
+    apiKey: '',
+    webhookUrl: '',
+    autoPushWebhook: false,
+  });
   const [stats, setStats] = useState<{ totalEntries: number; doneCount: number; totalSizeMb: string }>({
     totalEntries: 0,
     doneCount: 0,
@@ -47,9 +52,33 @@ export default function App() {
     }, 3000);
   }, []);
 
+  const loadIntegrationSettings = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/integration/settings');
+      if (!res.ok) return;
+      const data = (await res.json()) as IntegrationConfig;
+      setIntegrationConfig(data);
+    } catch {
+      // Ignore
+    }
+  }, []);
+
   const refreshBackendStatus = useCallback(async () => {
     const status = await checkBackendStatus();
     setIsBackendOnline(status.ok);
+    if (status.ok) {
+      loadIntegrationSettings();
+    }
+  }, [loadIntegrationSettings]);
+
+  const handleJobsUpdated = useCallback((newJobs: DownloadJob[]) => {
+    setCompletedJobs((prev) => {
+      const map = new Map(prev.map((j) => [j.jobId, j]));
+      for (const j of newJobs) {
+        if (j.state === 'done') map.set(j.jobId, j);
+      }
+      return Array.from(map.values());
+    });
   }, []);
 
   useEffect(() => {
@@ -247,21 +276,15 @@ export default function App() {
             embedTags={embedTags}
             autoProcessOnUpload={autoProcessOnUpload}
             autoDownloadEach={autoDownloadEach}
+            webhookUrl={integrationConfig.webhookUrl}
+            completedJobs={completedJobs}
             playingLocalId={playingEntry?.localId || null}
             isPlaying={isPlaying}
             onTogglePlayEntry={handleTogglePlayEntry}
             showToast={showToast}
             onOpenIntegrationModal={() => setIsIntegrationModalOpen(true)}
             onStatsChange={setStats}
-            onJobsUpdated={(newJobs) => {
-              setCompletedJobs((prev) => {
-                const map = new Map(prev.map((j) => [j.jobId, j]));
-                for (const j of newJobs) {
-                  if (j.state === 'done') map.set(j.jobId, j);
-                }
-                return Array.from(map.values());
-              });
-            }}
+            onJobsUpdated={handleJobsUpdated}
           />
         </main>
 
@@ -298,6 +321,8 @@ export default function App() {
           onClose={() => setIsIntegrationModalOpen(false)}
           completedJobs={completedJobs}
           showToast={showToast}
+          onSettingsSaved={setIntegrationConfig}
+          onJobsUpdated={handleJobsUpdated}
         />
 
         <BackendConnectionModal

@@ -19,6 +19,8 @@ interface IntegrationModalProps {
   onClose: () => void;
   completedJobs: DownloadJob[];
   showToast: (msg: string) => void;
+  onSettingsSaved?: (config: IntegrationConfig) => void;
+  onJobsUpdated?: (jobs: DownloadJob[]) => void;
 }
 
 export function IntegrationModal({
@@ -26,6 +28,8 @@ export function IntegrationModal({
   onClose,
   completedJobs,
   showToast,
+  onSettingsSaved,
+  onJobsUpdated,
 }: IntegrationModalProps) {
   const [config, setConfig] = useState<IntegrationConfig>({
     apiKey: '',
@@ -35,6 +39,8 @@ export function IntegrationModal({
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [isTesting, setIsTesting] = useState<boolean>(false);
+  const [isPushingAll, setIsPushingAll] = useState<boolean>(false);
+  const [pushingJobIds, setPushingJobIds] = useState<Set<string>>(new Set());
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState<boolean>(false);
   const [copiedEndpoint, setCopiedEndpoint] = useState<boolean>(false);
@@ -84,7 +90,10 @@ export function IntegrationModal({
         const res = await apiFetch('/api/integration/settings');
         if (!res.ok) return;
         const data = (await res.json()) as IntegrationConfig;
-        if (!cancelled) setConfig(data);
+        if (!cancelled) {
+          setConfig(data);
+          onSettingsSaved?.(data);
+        }
       } catch {
         // Ignore
       } finally {
@@ -94,7 +103,7 @@ export function IntegrationModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen]);
+  }, [isOpen, onSettingsSaved]);
 
   const handleSaveSettings = async (regenerate = false) => {
     setIsSaving(true);
@@ -111,6 +120,7 @@ export function IntegrationModal({
       if (!res.ok) throw new Error('Không thể lưu cài đặt.');
       const data = (await res.json()) as IntegrationConfig;
       setConfig(data);
+      onSettingsSaved?.(data);
       showToast(regenerate ? 'Đã tạo mới API Key thành công!' : 'Đã lưu cấu hình liên kết app nhạc.');
     } catch {
       showToast('Lỗi khi lưu cấu hình.');
@@ -147,6 +157,72 @@ export function IntegrationModal({
       });
     } finally {
       setIsTesting(false);
+    }
+  };
+
+  const handlePushFromModal = async (targetJobs: DownloadJob[], singleMode = false) => {
+    const targetUrl = config.webhookUrl.trim();
+    if (!targetUrl) {
+      showToast('Vui lòng nhập Webhook URL ở mục 2 trước khi đẩy bài hát.');
+      return;
+    }
+    if (targetJobs.length === 0) return;
+
+    const targetIds = targetJobs.map((j) => j.jobId);
+    if (!singleMode) setIsPushingAll(true);
+    setPushingJobIds((prev) => {
+      const next = new Set(prev);
+      targetIds.forEach((id) => next.add(id));
+      return next;
+    });
+
+    try {
+      const res = await apiFetch('/api/local/push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobIds: targetIds,
+          webhookUrl: targetUrl,
+        }),
+      });
+      const data = (await res.json()) as {
+        total?: number;
+        pushedCount?: number;
+        failedCount?: number;
+        results?: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }>;
+        jobs?: Record<string, DownloadJob>;
+        error?: string;
+      };
+
+      if (!res.ok) {
+        showToast(data.error || 'Không thể đẩy bài hát sang App.');
+        return;
+      }
+
+      if (data.jobs && onJobsUpdated) {
+        onJobsUpdated(Object.values(data.jobs));
+      }
+
+      const pushedCount = data.pushedCount || 0;
+      const failedCount = data.failedCount || 0;
+      const firstFail = data.results?.find((r) => !r.success)?.message || '';
+
+      if (failedCount === 0) {
+        showToast(`Đã đẩy ${pushedCount} bài hát sang App Nhạc thành công!`);
+      } else if (pushedCount > 0) {
+        showToast(`Đã đẩy ${pushedCount}/${data.total || targetIds.length} bài thành công, ${failedCount} bài lỗi (${firstFail}).`);
+      } else {
+        showToast(`Đẩy sang App thất bại: ${firstFail || 'Kiểm tra lại Webhook URL.'}`);
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Lỗi kết nối webhook khi đẩy bài hát.');
+    } finally {
+      if (!singleMode) setIsPushingAll(false);
+      setPushingJobIds((prev) => {
+        const next = new Set(prev);
+        targetIds.forEach((id) => next.delete(id));
+        return next;
+      });
     }
   };
 
@@ -320,7 +396,7 @@ export function IntegrationModal({
                 <span>2. Webhook Tự Động Đẩy Bài Hát Sang App Nhạc</span>
               </span>
               <p className="text-xs text-slate-400">
-                Mỗi khi SpotFlow tải xong bài hát kèm ảnh bìa và lyrics, hệ thống sẽ tự động gọi HTTP POST tới URL của bạn.
+                Mỗi khi SpotFlow xử lý xong file MP3 kèm ảnh bìa và lyrics, hệ thống sẽ tự động gọi HTTP POST tới URL của bạn (hoặc dùng nút Đẩy sang App thủ công bên dưới).
               </p>
 
               <div className="space-y-2">
@@ -338,7 +414,7 @@ export function IntegrationModal({
                     type="button"
                     onClick={handleTestWebhook}
                     disabled={isTesting || !config.webhookUrl.trim()}
-                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] disabled:opacity-40 text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5"
+                    className="h-9 px-3 rounded bg-white/[0.08] hover:bg-white/[0.14] disabled:opacity-40 text-xs font-medium text-white transition-colors shrink-0 cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap"
                   >
                     {isTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin text-[#1DB954]" /> : <Send className="h-3.5 w-3.5" />}
                     <span>Kiểm tra</span>
@@ -353,14 +429,15 @@ export function IntegrationModal({
                     }`}
                   >
                     {testResult.message}
+                    {testResult.success && ' — Bấm "Lưu cài đặt liên kết" để lưu URL này.'}
                   </div>
                 )}
               </div>
 
               <div className="flex items-center justify-between pt-1">
                 <div>
-                  <div className="text-xs font-medium text-slate-200">Tự động đẩy khi tải xong</div>
-                  <div className="text-xs text-slate-500">Tự động gọi webhook ngay khi hoàn tất convert MP3</div>
+                  <div className="text-xs font-medium text-slate-200">Tự động đẩy khi xử lý xong</div>
+                  <div className="text-xs text-slate-500">Tự động gọi webhook ngay khi hoàn tất gắn ảnh bìa &amp; lyrics</div>
                 </div>
                 <button
                   type="button"
@@ -384,7 +461,7 @@ export function IntegrationModal({
                   type="button"
                   onClick={() => handleSaveSettings(false)}
                   disabled={isSaving}
-                  className="px-4 py-2 rounded-md bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold transition-colors cursor-pointer inline-flex items-center gap-1.5"
+                  className="px-4 py-2 rounded-md bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold transition-colors cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap"
                 >
                   {isSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                   <span>Lưu cài đặt liên kết</span>
@@ -392,48 +469,97 @@ export function IntegrationModal({
               </div>
             </div>
 
-            {/* Step 3: Lyrics & Downloaded Tracks Inspector */}
+            {/* Step 3: Processed Tracks & Manual Push */}
             <div className="space-y-3 rounded-lg bg-[#090B0E] p-4 border border-white/[0.08]">
-              <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954] flex items-center gap-1.5">
-                <Sparkles className="h-3.5 w-3.5" />
-                <span>3. Bài hát đã tải &amp; Lời bài hát (Lyrics) đã nhúng</span>
-              </span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider text-[#1DB954] flex items-center gap-1.5">
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <span>3. Bài hát đã xử lý &amp; Đẩy sang App ({completedJobs.length})</span>
+                </span>
+                {completedJobs.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => handlePushFromModal(completedJobs, false)}
+                    disabled={isPushingAll || !config.webhookUrl.trim()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-45 text-[#090B0E] text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    {isPushingAll ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <span>Đang đẩy...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Send className="h-3.5 w-3.5" />
+                        <span>Đẩy tất cả sang App</span>
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
 
               {completedJobs.length === 0 ? (
                 <p className="text-xs text-slate-400 py-2">
-                  Chưa có bài hát nào được tải xong trong phiên này. Hãy tải xuống một vài bài hát để kiểm tra lyrics và dữ liệu API.
+                  Chưa có bài hát nào được xử lý xong trong phiên này. Hãy kéo thả file MP3 và bấm &quot;Xử lý &amp; Gắn thẻ&quot; để chuẩn bị bài hát đẩy sang App.
                 </p>
               ) : (
-                <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {completedJobs.map((j) => (
-                    <div
-                      key={j.jobId}
-                      className="flex items-center justify-between p-2.5 rounded bg-[#141920] border border-white/[0.06] text-xs"
-                    >
-                      <div className="min-w-0 pr-3">
-                        <div className="font-medium text-white truncate">{j.title}</div>
-                        <div className="text-slate-400 truncate">{j.artist}</div>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {j.plainLyrics || j.syncedLyrics ? (
-                          <span className="px-2 py-0.5 rounded bg-[#1DB954]/15 text-[#1DB954] text-[10px] font-mono">
-                            Có Lyrics
+                <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  {completedJobs.map((j) => {
+                    const isPushing = pushingJobIds.has(j.jobId);
+                    return (
+                      <div
+                        key={j.jobId}
+                        className="flex items-center justify-between gap-3 p-2.5 rounded bg-[#141920] border border-white/[0.06] text-xs"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="font-medium text-white truncate">{j.title}</div>
+                          <div className="text-slate-400 truncate flex items-center gap-2">
+                            <span className="truncate">{j.artist}</span>
+                            {j.webhookStatus === 'pushed' && (
+                              <span className="text-[#1DB954] shrink-0">· Đã đẩy sang App</span>
+                            )}
+                            {j.webhookStatus === 'error' && (
+                              <span
+                                title={j.webhookMessage || ''}
+                                className="text-red-400 truncate"
+                              >
+                                · {j.webhookMessage || 'Lỗi đẩy'}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span
+                            className={`text-[11px] font-mono whitespace-nowrap ${
+                              j.plainLyrics || j.syncedLyrics ? 'text-[#1DB954]' : 'text-slate-500'
+                            }`}
+                          >
+                            {j.plainLyrics || j.syncedLyrics ? 'Có Lyrics' : 'Chưa có lyrics'}
                           </span>
-                        ) : (
-                          <span className="px-2 py-0.5 rounded bg-white/[0.05] text-slate-500 text-[10px] font-mono">
-                            Không có lyrics
-                          </span>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => setSelectedLyricsJob(j)}
-                          className="px-2.5 py-1 rounded bg-white/[0.08] hover:bg-white/[0.14] text-white transition-colors cursor-pointer"
-                        >
-                          Xem Lyrics
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedLyricsJob(j)}
+                            className="px-2.5 py-1 rounded bg-white/[0.08] hover:bg-white/[0.14] text-white transition-colors cursor-pointer whitespace-nowrap"
+                          >
+                            Xem Lyrics
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handlePushFromModal([j], true)}
+                            disabled={isPushing || !config.webhookUrl.trim()}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#1DB954]/20 hover:bg-[#1DB954]/30 disabled:opacity-45 text-[#6ee79c] font-medium transition-colors cursor-pointer whitespace-nowrap"
+                          >
+                            {isPushing ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Send className="h-3 w-3" />
+                            )}
+                            <span>{j.webhookStatus === 'pushed' || j.webhookStatus === 'error' ? 'Đẩy lại' : 'Đẩy App'}</span>
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>

@@ -52,6 +52,9 @@ interface DownloadJob {
   durationMs?: number;
   syncedLyrics?: string | null;
   plainLyrics?: string | null;
+  webhookStatus?: 'idle' | 'pushing' | 'pushed' | 'error';
+  webhookMessage?: string | null;
+  pushedAt?: string | null;
 }
 
 interface IntegrationSettings {
@@ -68,12 +71,41 @@ interface ItunesSearchResult {
   trackTimeMillis?: number;
 }
 
+const SETTINGS_FILE = path.join(WORKSPACE_DIR, 'integration_settings.json');
 const jobs = new Map<string, DownloadJob>();
 const integrationSettings: IntegrationSettings = {
   apiKey: `sf_live_${crypto.randomBytes(16).toString('hex')}`,
   webhookUrl: '',
   autoPushWebhook: false,
 };
+
+async function loadIntegrationSettings(): Promise<void> {
+  try {
+    if (!fs.existsSync(SETTINGS_FILE)) return;
+    const raw = await fsp.readFile(SETTINGS_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<IntegrationSettings>;
+    if (typeof parsed.apiKey === 'string' && parsed.apiKey.trim()) {
+      integrationSettings.apiKey = parsed.apiKey.trim();
+    }
+    if (typeof parsed.webhookUrl === 'string') {
+      integrationSettings.webhookUrl = parsed.webhookUrl.trim();
+    }
+    if (typeof parsed.autoPushWebhook === 'boolean') {
+      integrationSettings.autoPushWebhook = parsed.autoPushWebhook;
+    }
+  } catch {
+    // Ignore malformed file
+  }
+}
+
+async function saveIntegrationSettings(): Promise<void> {
+  try {
+    await ensureWorkspace();
+    await fsp.writeFile(SETTINGS_FILE, JSON.stringify(integrationSettings, null, 2), 'utf8');
+  } catch {
+    // Ignore disk write error
+  }
+}
 
 async function ensureWorkspace(): Promise<void> {
   await fsp.mkdir(WORKSPACE_DIR, { recursive: true });
@@ -417,8 +449,21 @@ async function enrichTrackMetadata(input: {
   };
 }
 
-async function triggerWebhookNotification(job: DownloadJob, reqHost: string, reqProtocol: string) {
-  if (!integrationSettings.autoPushWebhook || !integrationSettings.webhookUrl) return;
+async function pushJobToWebhook(
+  job: DownloadJob,
+  reqHost: string,
+  reqProtocol: string,
+  targetWebhookUrl?: string
+): Promise<{ success: boolean; status: number; message: string }> {
+  const webhookUrl = (targetWebhookUrl || integrationSettings.webhookUrl || '').trim();
+  if (!webhookUrl) {
+    return { success: false, status: 400, message: 'Chưa cấu hình Webhook URL.' };
+  }
+
+  job.webhookStatus = 'pushing';
+  job.webhookMessage = 'Đang đẩy bài hát sang App...';
+  job.updatedAt = Date.now();
+
   try {
     const payload = {
       event: 'track_downloaded',
@@ -439,17 +484,51 @@ async function triggerWebhookNotification(job: DownloadJob, reqHost: string, req
       },
     };
 
-    await fetch(integrationSettings.webhookUrl, {
+    const res = await fetch(webhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-API-Key': integrationSettings.apiKey,
       },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(45000),
     });
-  } catch {
-    // Suppress webhook dispatch errors
+
+    const respText = await res.text().catch(() => '');
+    let parsedMsg = '';
+    try {
+      const json = JSON.parse(respText) as { message?: string; error?: string };
+      parsedMsg = json.message || json.error || '';
+    } catch {
+      parsedMsg = respText.slice(0, 140);
+    }
+
+    if (res.ok) {
+      job.webhookStatus = 'pushed';
+      job.webhookMessage = parsedMsg || `Đã đẩy sang App (${res.status})`;
+      job.pushedAt = new Date().toISOString();
+      job.updatedAt = Date.now();
+      return { success: true, status: res.status, message: job.webhookMessage };
+    }
+
+    job.webhookStatus = 'error';
+    job.webhookMessage = parsedMsg
+      ? `App báo lỗi ${res.status}: ${parsedMsg}`
+      : `App phản hồi mã lỗi ${res.status}`;
+    job.updatedAt = Date.now();
+    return { success: false, status: res.status, message: job.webhookMessage };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Không thể kết nối tới Webhook URL của App.';
+    job.webhookStatus = 'error';
+    job.webhookMessage = msg;
+    job.updatedAt = Date.now();
+    return { success: false, status: 500, message: msg };
   }
+}
+
+async function triggerWebhookNotification(job: DownloadJob, reqHost: string, reqProtocol: string) {
+  if (!integrationSettings.autoPushWebhook || !integrationSettings.webhookUrl) return;
+  await pushJobToWebhook(job, reqHost, reqProtocol);
 }
 
 async function processLocalUploadJob(
@@ -551,15 +630,25 @@ async function processLocalUploadJob(
     }
 
     const stat = await fsp.stat(finalMp3Path);
-    job.state = 'done';
-    job.progress = 100;
-    job.message = 'Đã gắn ảnh bìa & lyrics hoàn tất';
     job.filePath = finalMp3Path;
     job.fileName = `${finalBaseName}.mp3`;
     job.fileSizeBytes = stat.size;
-    job.updatedAt = Date.now();
 
-    triggerWebhookNotification(job, reqHost, reqProtocol).catch(() => {});
+    if (integrationSettings.autoPushWebhook && integrationSettings.webhookUrl) {
+      job.progress = 92;
+      job.message = 'Đang tự động đẩy bài hát sang App Nhạc...';
+      job.webhookStatus = 'pushing';
+      job.updatedAt = Date.now();
+      await pushJobToWebhook(job, reqHost, reqProtocol);
+    }
+
+    job.state = 'done';
+    job.progress = 100;
+    job.message =
+      job.webhookStatus === 'pushed'
+        ? 'Đã gắn thẻ & đẩy sang App Nhạc'
+        : 'Đã gắn ảnh bìa & lyrics hoàn tất';
+    job.updatedAt = Date.now();
   } catch (err) {
     job.state = 'error';
     job.progress = 0;
@@ -587,6 +676,7 @@ async function cleanupOldFiles(): Promise<void> {
 
 async function startServer() {
   await ensureWorkspace();
+  await loadIntegrationSettings();
   setInterval(() => {
     cleanupOldFiles().catch(() => {});
   }, 15 * 60 * 1000);
@@ -603,7 +693,7 @@ async function startServer() {
     res.json(integrationSettings);
   });
 
-  app.post('/api/integration/settings', (req: Request, res: Response) => {
+  app.post('/api/integration/settings', async (req: Request, res: Response) => {
     const body = req.body as { webhookUrl?: string; autoPushWebhook?: boolean; regenerateKey?: boolean };
     if (typeof body.webhookUrl === 'string') {
       integrationSettings.webhookUrl = body.webhookUrl.trim();
@@ -614,6 +704,7 @@ async function startServer() {
     if (body.regenerateKey) {
       integrationSettings.apiKey = `sf_live_${crypto.randomBytes(16).toString('hex')}`;
     }
+    await saveIntegrationSettings();
     res.json(integrationSettings);
   });
 
@@ -802,10 +893,60 @@ async function startServer() {
       plainLyrics: body.plainLyrics ?? null,
       coverUrl: body.coverUrl?.trim() || null,
       durationMs: 0,
+      webhookStatus: 'idle',
+      webhookMessage: null,
+      pushedAt: null,
     };
 
     jobs.set(jobId, job);
     res.json({ jobId, job });
+  });
+
+  // Push completed tracks directly to the configured Music App Webhook
+  app.post('/api/local/push', async (req: Request, res: Response) => {
+    const body = req.body as { jobIds?: string[]; webhookUrl?: string };
+    const targetUrl = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
+    if (!targetUrl) {
+      res.status(400).json({ error: 'Chưa cấu hình Webhook URL trong Liên kết App Nhạc.' });
+      return;
+    }
+
+    const ids = Array.isArray(body.jobIds) ? body.jobIds : [];
+    const targetJobs = ids
+      .map((id) => jobs.get(id))
+      .filter((j): j is DownloadJob => Boolean(j && j.state === 'done' && j.filePath && fs.existsSync(j.filePath)));
+
+    if (targetJobs.length === 0) {
+      res.status(400).json({ error: 'Không có bài hát hoàn tất nào hợp lệ để đẩy sang App.' });
+      return;
+    }
+
+    const reqHost = req.get('host') || 'localhost:3000';
+    const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+
+    const results: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }> = [];
+    const updatedJobs: Record<string, DownloadJob> = {};
+
+    for (const job of targetJobs) {
+      const outcome = await pushJobToWebhook(job, reqHost, reqProtocol, targetUrl);
+      results.push({
+        jobId: job.jobId,
+        title: job.title,
+        ...outcome,
+      });
+      updatedJobs[job.jobId] = { ...job, filePath: null };
+    }
+
+    const pushedCount = results.filter((r) => r.success).length;
+    const failedCount = results.length - pushedCount;
+
+    res.json({
+      total: results.length,
+      pushedCount,
+      failedCount,
+      results,
+      jobs: updatedJobs,
+    });
   });
 
   app.post(

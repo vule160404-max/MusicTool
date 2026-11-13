@@ -11,6 +11,7 @@ import {
   Pause,
   Play,
   RefreshCw,
+  Send,
   Trash2,
   Upload,
   Webhook,
@@ -24,6 +25,8 @@ interface LocalEnrichViewProps {
   embedTags: boolean;
   autoProcessOnUpload: boolean;
   autoDownloadEach: boolean;
+  webhookUrl: string;
+  completedJobs: DownloadJob[];
   playingLocalId: string | null;
   isPlaying: boolean;
   onTogglePlayEntry: (entry: LocalTrackEntry) => void;
@@ -70,6 +73,8 @@ export function LocalEnrichView({
   embedTags,
   autoProcessOnUpload,
   autoDownloadEach,
+  webhookUrl,
+  completedJobs,
   playingLocalId,
   isPlaying,
   onTogglePlayEntry,
@@ -83,6 +88,8 @@ export function LocalEnrichView({
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isProcessingAll, setIsProcessingAll] = useState<boolean>(false);
   const [isZipping, setIsZipping] = useState<boolean>(false);
+  const [isPushingAll, setIsPushingAll] = useState<boolean>(false);
+  const [pushingJobIds, setPushingJobIds] = useState<Set<string>>(new Set());
   const [editingLyricsId, setEditingLyricsId] = useState<string | null>(null);
   const [editingCoverId, setEditingCoverId] = useState<string | null>(null);
 
@@ -93,6 +100,29 @@ export function LocalEnrichView({
   const doneJobs = entries
     .map((e) => e.job)
     .filter((j): j is DownloadJob => Boolean(j && j.state === 'done'));
+
+  useEffect(() => {
+    if (completedJobs.length === 0) return;
+    const jobMap = new Map(completedJobs.map((j) => [j.jobId, j]));
+    setEntries((prev) => {
+      let changed = false;
+      const next = prev.map((e) => {
+        if (!e.job) return e;
+        const latest = jobMap.get(e.job.jobId);
+        if (
+          latest &&
+          (latest.webhookStatus !== e.job.webhookStatus ||
+            latest.webhookMessage !== e.job.webhookMessage ||
+            latest.pushedAt !== e.job.pushedAt)
+        ) {
+          changed = true;
+          return { ...e, job: latest };
+        }
+        return e;
+      });
+      return changed ? next : prev;
+    });
+  }, [completedJobs]);
 
   useEffect(() => {
     const totalBytes = entries.reduce(
@@ -372,6 +402,78 @@ export function LocalEnrichView({
     }
   };
 
+  const handlePushJobs = async (targetJobs: DownloadJob[], singleMode = false) => {
+    const validTargets = targetJobs.filter((j) => j.state === 'done');
+    if (validTargets.length === 0) return;
+
+    if (!webhookUrl.trim()) {
+      showToast('Chưa có Webhook URL. Hãy nhập và lưu URL trong "Liên kết App Nhạc & R2".');
+      onOpenIntegrationModal();
+      return;
+    }
+
+    const targetIds = validTargets.map((j) => j.jobId);
+    if (!singleMode) setIsPushingAll(true);
+    setPushingJobIds((prev) => {
+      const next = new Set(prev);
+      targetIds.forEach((id) => next.add(id));
+      return next;
+    });
+
+    try {
+      const res = await apiFetch('/api/local/push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobIds: targetIds,
+          webhookUrl: webhookUrl.trim(),
+        }),
+      });
+      const data = (await res.json()) as {
+        total?: number;
+        pushedCount?: number;
+        failedCount?: number;
+        results?: Array<{ jobId: string; title: string; success: boolean; status: number; message: string }>;
+        jobs?: Record<string, DownloadJob>;
+        error?: string;
+      };
+
+      if (!res.ok) {
+        showToast(data.error || 'Không thể đẩy bài hát sang App Nhạc.');
+        return;
+      }
+
+      if (data.jobs) {
+        const updatedMap = data.jobs;
+        setEntries((prev) =>
+          prev.map((e) => (e.job && updatedMap[e.job.jobId] ? { ...e, job: updatedMap[e.job.jobId] } : e))
+        );
+        onJobsUpdated(Object.values(updatedMap));
+      }
+
+      const pushedCount = data.pushedCount || 0;
+      const failedCount = data.failedCount || 0;
+      const firstFail = data.results?.find((r) => !r.success)?.message || '';
+
+      if (failedCount === 0) {
+        showToast(`Đã đẩy ${pushedCount} bài hát (kèm ảnh bìa & lyrics) sang App Nhạc thành công!`);
+      } else if (pushedCount > 0) {
+        showToast(`Đã đẩy ${pushedCount}/${data.total || targetIds.length} bài thành công, ${failedCount} bài lỗi (${firstFail}).`);
+      } else {
+        showToast(`Đẩy sang App thất bại: ${firstFail || 'Kiểm tra lại Webhook URL của App.'}`);
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Lỗi kết nối khi đẩy sang App.');
+    } finally {
+      if (!singleMode) setIsPushingAll(false);
+      setPushingJobIds((prev) => {
+        const next = new Set(prev);
+        targetIds.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+  };
+
   const editingLyricsEntry = entries.find((e) => e.localId === editingLyricsId) || null;
   const editingCoverEntry = entries.find((e) => e.localId === editingCoverId) || null;
   const pendingCount = entries.filter((e) => !e.job || e.job.state === 'error').length;
@@ -434,24 +536,49 @@ export function LocalEnrichView({
 
             <div className="flex flex-wrap items-center gap-2">
               {doneJobs.length > 0 && (
-                <button
-                  type="button"
-                  onClick={handleDownloadAllZip}
-                  disabled={isZipping}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md bg-white text-[#090B0E] hover:bg-slate-200 disabled:opacity-60 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  {isZipping ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      <span>Đang nén ZIP...</span>
-                    </>
-                  ) : (
-                    <>
-                      <FileArchive className="h-3.5 w-3.5" />
-                      <span>Tải bộ MP3 đã gắn tag (.ZIP · {doneJobs.length})</span>
-                    </>
-                  )}
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handlePushJobs(doneJobs, false)}
+                    disabled={isPushingAll}
+                    className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60 ${
+                      pendingCount === 0
+                        ? 'bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E]'
+                        : 'border border-[#1DB954]/45 bg-[#1DB954]/15 hover:bg-[#1DB954]/25 text-[#6ee79c]'
+                    }`}
+                  >
+                    {isPushingAll ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <span>Đang đẩy sang App...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Send className="h-3.5 w-3.5" />
+                        <span>Đẩy sang App ({doneJobs.length})</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleDownloadAllZip}
+                    disabled={isZipping}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md bg-white text-[#090B0E] hover:bg-slate-200 disabled:opacity-60 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {isZipping ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <span>Đang nén ZIP...</span>
+                      </>
+                    ) : (
+                      <>
+                        <FileArchive className="h-3.5 w-3.5" />
+                        <span>Tải bộ MP3 (.ZIP · {doneJobs.length})</span>
+                      </>
+                    )}
+                  </button>
+                </>
               )}
 
               <button
@@ -468,7 +595,7 @@ export function LocalEnrichView({
                 ) : (
                   <>
                     <Check className="h-3.5 w-3.5" />
-                    <span>Xử lý &amp; Đồng bộ tất cả ({pendingCount})</span>
+                    <span>Xử lý &amp; Gắn thẻ ({pendingCount})</span>
                   </>
                 )}
               </button>
@@ -517,7 +644,7 @@ export function LocalEnrichView({
                 <th className="py-2.5 px-3 w-44">Lời bài hát (Lyrics)</th>
                 <th className="py-2.5 px-3 w-24 text-right hidden sm:table-cell">Thời lượng</th>
                 <th className="py-2.5 px-3 w-24 text-right hidden md:table-cell">Dung lượng</th>
-                <th className="py-2.5 pl-3 pr-4 sm:pr-6 w-[235px] text-right">Thao tác</th>
+                <th className="py-2.5 pl-3 pr-4 sm:pr-6 w-[290px] text-right">Thao tác</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-white/[0.06]">
@@ -715,12 +842,49 @@ export function LocalEnrichView({
                       )}
 
                       {isDone && job && (
-                        <div className="inline-flex items-center gap-2">
-                          <span className="text-xs text-[#1DB954] whitespace-nowrap">Đã nhúng ID3</span>
+                        <div className="inline-flex items-center justify-end gap-2">
+                          {job.webhookStatus === 'pushed' ? (
+                            <span
+                              title={job.webhookMessage || 'Đã đẩy sang App Nhạc'}
+                              className="text-xs text-[#1DB954] whitespace-nowrap"
+                            >
+                              Đã đẩy App
+                            </span>
+                          ) : job.webhookStatus === 'error' ? (
+                            <span
+                              title={job.webhookMessage || 'Lỗi đẩy sang App'}
+                              className="text-xs text-red-400 truncate max-w-[105px]"
+                            >
+                              Lỗi đẩy App
+                            </span>
+                          ) : (
+                            <span className="text-xs text-slate-400 whitespace-nowrap">Đã gắn ID3</span>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => handlePushJobs([job], true)}
+                            disabled={pushingJobIds.has(job.jobId)}
+                            title={
+                              job.webhookStatus === 'error' && job.webhookMessage
+                                ? job.webhookMessage
+                                : 'Đẩy bài hát này sang App Nhạc & R2'
+                            }
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-60 text-[#090B0E] text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                          >
+                            {pushingJobIds.has(job.jobId) ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Send className="h-3.5 w-3.5" />
+                            )}
+                            <span>{job.webhookStatus === 'pushed' || job.webhookStatus === 'error' ? 'Đẩy lại' : 'Đẩy App'}</span>
+                          </button>
+
                           <button
                             type="button"
                             onClick={() => triggerSaveJobFile(job)}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#1DB954] hover:bg-[#1ED760] text-[#090B0E] text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                            title="Tải file MP3 đã gắn thẻ về máy"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-white/[0.08] hover:bg-white/[0.14] text-white text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                           >
                             <Download className="h-3.5 w-3.5" />
                             <span>Lưu MP3</span>
