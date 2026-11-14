@@ -1954,29 +1954,40 @@ export function LocalEnrichView({
       !pickedFolderName &&
       (/^[a-zA-Z]:[\\/]/.test(trimmedPathPreview) || /^\\\\/.test(trimmedPathPreview))
   );
-  const handleDownloadWindowsSyncBat = () => {
+  const handleDownloadWindowsSyncBat = (mode: 'menu' | 'repair' = 'menu') => {
     const base = getBackendBaseUrl() || (typeof window !== 'undefined' ? window.location.origin : '');
     const folder =
       trimmedPathPreview || 'C:\\Users\\vule1\\Music\\Spotify Downloader';
+    const trimmedWebhook = webhookUrl.trim();
     const params = new URLSearchParams({
       folderPath: folder,
       serverUrl: base,
-      webhookUrl: webhookUrl.trim(),
+      webhookUrl: trimmedWebhook,
+      mode,
     });
+    const fileName = mode === 'repair' ? 'SpotFlow-QuetBu-R2.bat' : 'SpotFlow-AutoSync.bat';
     const a = document.createElement('a');
     a.href = `${base}/api/local/windows-sync-bundle?${params.toString()}`;
-    a.download = 'SpotFlow-AutoSync.bat';
+    a.download = fileName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
 
+    const webhookHint = trimmedWebhook
+      ? ''
+      : ' (Lưu ý: Bạn chưa điền Webhook URL nên khi chạy .bat hãy dán URL Webhook App Nhạc nếu muốn cập nhật lên App)';
+
     if (typeof window !== 'undefined' && window.location.hostname.includes('run.app')) {
       showToast(
-        'Đã tải SpotFlow-AutoSync.bat! Lưu ý: Để chạy tool từ máy Windows không vướng đăng nhập Google, hãy tải bản .bat từ link Render đã deploy của bạn.'
+        `Đã tải ${fileName}! Lưu ý: Để chạy tool từ máy Windows không vướng đăng nhập Google, hãy tải file .bat từ link Render đã deploy của bạn.${webhookHint}`
+      );
+    } else if (mode === 'repair') {
+      showToast(
+        `Đã tải ${fileName} (Chế độ Quét bù ảnh bìa & lyrics)! Nháy đúp file này trên Windows để quét lại thư mục MP3 và ghi đè bù vào R2 + App.${webhookHint}`
       );
     } else {
       showToast(
-        'Đã tải SpotFlow-AutoSync.bat! Nháy đúp file này trên Windows để tự quét 50 bài/lượt & đẩy thẳng lên R2 (không qua Render).'
+        `Đã tải ${fileName}! Nháy đúp trên Windows và chọn [1] Tải bài mới hoặc [2] Quét bù ảnh bìa & lyrics.${webhookHint}`
       );
     }
   };
@@ -2099,13 +2110,24 @@ export function LocalEnrichView({
 
             <button
               type="button"
-              onClick={handleDownloadWindowsSyncBat}
+              onClick={() => handleDownloadWindowsSyncBat('menu')}
               disabled={isAutoFolderRunning}
-              title="Tải file SpotFlow-AutoSync.bat chạy trên máy Windows: tự quét thư mục đã nhập, lọc trùng 50 bài/lượt và đẩy thẳng lên R2 (0% tải cho Render!)"
+              title="Tải SpotFlow-AutoSync.bat chạy trên Windows: hỗ trợ tải bài mới & quét bù ảnh bìa/lyrics (0% tải cho Render)"
               className="h-9 px-2.5 rounded-md border border-sky-500/35 bg-sky-500/10 hover:bg-sky-500/20 disabled:opacity-45 text-xs font-medium text-sky-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
             >
               <Download className="h-3.5 w-3.5 text-sky-400" />
               <span>Tool PC (.bat)</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleDownloadWindowsSyncBat('repair')}
+              disabled={isAutoFolderRunning}
+              title="Tải SpotFlow-QuetBu-R2.bat: Quét lại thư mục MP3 trên Windows, tự tìm ảnh bìa HD + lyrics và ghi đè bù vào đúng bài đang thiếu trên R2 & App (không tạo trùng bài)"
+              className="h-9 px-2.5 rounded-md border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-45 text-xs font-medium text-amber-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <RefreshCw className="h-3.5 w-3.5 text-amber-400" />
+              <span>Quét bù (.bat)</span>
             </button>
 
             <label
@@ -2184,11 +2206,19 @@ export function LocalEnrichView({
               <div className="flex flex-wrap items-center gap-1.5 shrink-0">
                 <button
                   type="button"
-                  onClick={handleDownloadWindowsSyncBat}
+                  onClick={() => handleDownloadWindowsSyncBat('menu')}
                   className="px-2.5 py-1 rounded bg-sky-500 hover:bg-sky-400 text-[#090B0E] font-semibold text-xs inline-flex items-center gap-1 cursor-pointer"
                 >
                   <Download className="h-3 w-3" />
                   <span>Tải Tool PC (.bat)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleDownloadWindowsSyncBat('repair')}
+                  className="px-2.5 py-1 rounded bg-amber-400 hover:bg-amber-300 text-[#090B0E] font-semibold text-xs inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  <span>Quét bù (.bat)</span>
                 </button>
                 {isInsideIframe ? (
                   <label
