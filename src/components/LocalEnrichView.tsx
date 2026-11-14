@@ -5,6 +5,7 @@ import {
   Download,
   FileArchive,
   FileAudio,
+  FolderOpen,
   History,
   Image as ImageIcon,
   Loader2,
@@ -14,6 +15,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  Square,
   Trash2,
   Upload,
   Webhook,
@@ -40,6 +42,33 @@ interface SkippedDuplicateInfo {
   matchedLabel: string;
   reason: 'history' | 'current';
 }
+
+interface BrowserFileHandle {
+  kind: 'file';
+  name: string;
+  getFile: () => Promise<File>;
+}
+
+interface BrowserDirHandle {
+  kind: 'directory';
+  name: string;
+  values: () => AsyncIterable<BrowserFileHandle | BrowserDirHandle>;
+}
+
+interface FolderRunStats {
+  source: 'browser' | 'server';
+  batchNumber: number;
+  batchTotal: number;
+  batchDone: number;
+  totalProcessed: number;
+  totalPushed: number;
+  totalErrors: number;
+  totalSkipped: number;
+  remainingInFolder: number;
+  phaseLabel: string;
+}
+
+const FOLDER_BATCH_SIZE = 50;
 
 interface LocalEnrichViewProps {
   bitrate: AudioBitrate;
@@ -117,6 +146,7 @@ export function LocalEnrichView({
   onSyncHistory,
 }: LocalEnrichViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
   const lrcInputRef = useRef<HTMLInputElement | null>(null);
   const [entries, setEntries] = useState<LocalTrackEntry[]>([]);
   const [skippedDuplicates, setSkippedDuplicates] = useState<SkippedDuplicateInfo[]>([]);
@@ -134,6 +164,33 @@ export function LocalEnrichView({
   const [isModalSearching, setIsModalSearching] = useState<boolean>(false);
   const [modalSearchNote, setModalSearchNote] = useState<string | null>(null);
   const [editingCoverId, setEditingCoverId] = useState<string | null>(null);
+
+  // 1-line Folder Path & Auto-Batch-50 states
+  const [folderPathInput, setFolderPathInput] = useState<string>(() => {
+    try {
+      return localStorage.getItem('spotflow_folder_path') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [pickedFolderName, setPickedFolderName] = useState<string | null>(null);
+  const [autoPushAfterBatch, setAutoPushAfterBatch] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('spotflow_folder_auto_push');
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
+  const [isAutoFolderRunning, setIsAutoFolderRunning] = useState<boolean>(false);
+  const [folderRunStats, setFolderRunStats] = useState<FolderRunStats | null>(null);
+  const [folderWarningMsg, setFolderWarningMsg] = useState<string | null>(null);
+
+  const dirHandleRef = useRef<BrowserDirHandle | null>(null);
+  const webkitSnapshotFilesRef = useRef<File[] | null>(null);
+  const stopFolderLoopRef = useRef<boolean>(false);
+  const historyItemsRef = useRef<UploadHistoryItem[]>(historyItems);
+  historyItemsRef.current = historyItems;
 
   const autoDownloadRef = useRef(autoDownloadEach);
   autoDownloadRef.current = autoDownloadEach;
@@ -901,6 +958,667 @@ export function LocalEnrichView({
     }
   };
 
+  const updateFolderPathInput = (val: string) => {
+    setFolderPathInput(val);
+    setFolderWarningMsg(null);
+    try {
+      localStorage.setItem('spotflow_folder_path', val);
+    } catch {
+      // Ignore storage error
+    }
+  };
+
+  const handleClearPickedFolder = () => {
+    dirHandleRef.current = null;
+    webkitSnapshotFilesRef.current = null;
+    setPickedFolderName(null);
+    setFolderWarningMsg(null);
+  };
+
+  const handlePickLocalFolder = async () => {
+    setFolderWarningMsg(null);
+    const winWithPicker = window as unknown as {
+      showDirectoryPicker?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<BrowserDirHandle>;
+    };
+
+    if (typeof winWithPicker.showDirectoryPicker === 'function') {
+      try {
+        const handle = await winWithPicker.showDirectoryPicker({ mode: 'read' });
+        dirHandleRef.current = handle;
+        webkitSnapshotFilesRef.current = null;
+        setPickedFolderName(handle.name);
+        updateFolderPathInput(handle.name);
+        showToast(`Đã gắn thư mục "${handle.name}". Bấm "Quét & Tải 50 bài/lượt" để tự động chạy.`);
+        return;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
+        }
+        // SecurityError in cross-origin iframe -> fallback to webkitdirectory input
+      }
+    }
+
+    folderInputRef.current?.click();
+  };
+
+  const handleWebkitFolderSelected = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    const files = Array.from(fileList);
+    dirHandleRef.current = null;
+    webkitSnapshotFilesRef.current = files;
+    const rel = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '';
+    const rootName = rel.split('/')[0] || `${files.length} file trong thư mục`;
+    setPickedFolderName(rootName);
+    updateFolderPathInput(rootName);
+    setFolderWarningMsg(null);
+    showToast(`Đã nạp thư mục "${rootName}" (${files.length} file). Bấm "Quét & Tải 50 bài/lượt" để chạy.`);
+  };
+
+  const fetchFreshHistoryForScan = async (): Promise<UploadHistoryItem[]> => {
+    try {
+      const res = await apiFetch('/api/history');
+      if (res.ok) {
+        const data = (await res.json()) as { items?: UploadHistoryItem[] };
+        if (Array.isArray(data.items)) {
+          const map = new Map<string, UploadHistoryItem>();
+          for (const item of [...data.items, ...historyItemsRef.current]) {
+            const k = item.trackKey || item.fileKey || item.id;
+            if (k && !map.has(k)) map.set(k, item);
+          }
+          return Array.from(map.values());
+        }
+      }
+    } catch {
+      // Fallback to local prop ref
+    }
+    return historyItemsRef.current;
+  };
+
+  const collectBrowserBatch = async (
+    latestHistory: UploadHistoryItem[],
+    sessionVisitedKeys: Set<string>
+  ): Promise<{
+    totalAudioFiles: number;
+    skippedCount: number;
+    remainingCount: number;
+    batchAudioFiles: File[];
+    lrcMap: Map<string, { syncedLyrics: string | null; plainLyrics: string }>;
+  }> => {
+    const normalizeStem = (name: string) =>
+      name.replace(/\.[a-zA-Z0-9]{2,5}$/, '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+    const audioEntries: Array<{ name: string; getFile: () => Promise<File> }> = [];
+    const lrcEntries: Array<{ stem: string; getFile: () => Promise<File> }> = [];
+
+    if (dirHandleRef.current) {
+      const walkHandle = async (dir: BrowserDirHandle, depth: number) => {
+        if (depth > 3) return;
+        for await (const item of dir.values()) {
+          if (item.kind === 'directory') {
+            await walkHandle(item, depth + 1);
+          } else if (item.kind === 'file') {
+            if (/\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(item.name)) {
+              audioEntries.push({ name: item.name, getFile: () => item.getFile() });
+            } else if (/\.(lrc|txt)$/i.test(item.name)) {
+              lrcEntries.push({ stem: normalizeStem(item.name), getFile: () => item.getFile() });
+            }
+          }
+        }
+      };
+      await walkHandle(dirHandleRef.current, 0);
+    } else if (webkitSnapshotFilesRef.current) {
+      for (const f of webkitSnapshotFilesRef.current) {
+        if (/\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(f.name)) {
+          audioEntries.push({ name: f.name, getFile: async () => f });
+        } else if (/\.(lrc|txt)$/i.test(f.name)) {
+          lrcEntries.push({ stem: normalizeStem(f.name), getFile: async () => f });
+        }
+      }
+    }
+
+    audioEntries.sort((a, b) => a.name.localeCompare(b.name, 'vi'));
+
+    let skippedCount = 0;
+    const unuploaded: Array<{ name: string; stem: string; getFile: () => Promise<File> }> = [];
+
+    for (const item of audioEntries) {
+      const fKey = normalizeFileKey(item.name);
+      const rawLower = item.name.toLowerCase();
+      if (sessionVisitedKeys.has(fKey) || sessionVisitedKeys.has(rawLower)) {
+        skippedCount++;
+        continue;
+      }
+      const guessed = guessTitleArtistFromName(item.name);
+      const dupMatch = findDuplicateHistoryMatch(
+        { fileName: item.name, title: guessed.title, artist: guessed.artist },
+        latestHistory
+      );
+      if (dupMatch) {
+        skippedCount++;
+        continue;
+      }
+      unuploaded.push({ name: item.name, stem: normalizeStem(item.name), getFile: item.getFile });
+    }
+
+    const batchSlice = unuploaded.slice(0, FOLDER_BATCH_SIZE);
+    const neededStems = new Set(batchSlice.map((b) => b.stem));
+    const batchAudioFiles: File[] = [];
+
+    // Read only the 50 selected File handles in parallel
+    let fileCursor = 0;
+    const fileResults = new Array<File | null>(batchSlice.length).fill(null);
+    await Promise.all(
+      Array.from({ length: Math.min(8, batchSlice.length) }).map(async () => {
+        while (fileCursor < batchSlice.length) {
+          const idx = fileCursor++;
+          try {
+            fileResults[idx] = await batchSlice[idx].getFile();
+          } catch {
+            fileResults[idx] = null;
+          }
+        }
+      })
+    );
+    for (const f of fileResults) {
+      if (f) batchAudioFiles.push(f);
+    }
+
+    const lrcMap = new Map<string, { syncedLyrics: string | null; plainLyrics: string }>();
+    const matchingLrcs = lrcEntries.filter((l) => neededStems.has(l.stem));
+    for (const lf of matchingLrcs) {
+      try {
+        const f = await lf.getFile();
+        const text = (await f.text()).trim();
+        if (text.length > 10) {
+          const isLrc = /\[\d{1,2}:\d{2}/.test(text);
+          const plain = isLrc
+            ? text
+                .split(/\r?\n/)
+                .map((line) => line.replace(/\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/g, '').trim())
+                .filter(Boolean)
+                .join('\n')
+            : text;
+          lrcMap.set(lf.stem, {
+            syncedLyrics: isLrc ? text : null,
+            plainLyrics: plain || text,
+          });
+        }
+      } catch {
+        // Ignore unreadable lrc
+      }
+    }
+
+    return {
+      totalAudioFiles: audioEntries.length,
+      skippedCount,
+      remainingCount: unuploaded.length,
+      batchAudioFiles,
+      lrcMap,
+    };
+  };
+
+  const pushBatchJobsParallel = async (jobsToPush: DownloadJob[]): Promise<number> => {
+    const valid = jobsToPush.filter((j) => j.state === 'done' && j.webhookStatus !== 'pushed');
+    if (valid.length === 0 || !webhookUrl.trim()) return 0;
+
+    let pushedTotal = 0;
+    const concurrency = Math.min(pushConcurrency || 4, valid.length);
+    const queue = [...valid];
+
+    await Promise.all(
+      Array.from({ length: concurrency }).map(async () => {
+        while (queue.length > 0) {
+          if (stopFolderLoopRef.current) break;
+          const job = queue.shift();
+          if (!job) break;
+          try {
+            const res = await apiFetch('/api/local/push', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jobIds: [job.jobId],
+                webhookUrl: webhookUrl.trim(),
+              }),
+            });
+            const data = (await res.json()) as {
+              pushedCount?: number;
+              jobs?: Record<string, DownloadJob>;
+            };
+            if (data.jobs) {
+              const updatedMap = data.jobs;
+              setEntries((prev) =>
+                prev.map((e) => (e.job && updatedMap[e.job.jobId] ? { ...e, job: updatedMap[e.job.jobId] } : e))
+              );
+              onJobsUpdated(Object.values(updatedMap));
+            }
+            if (res.ok && (data.pushedCount || 0) > 0) {
+              pushedTotal++;
+            }
+          } catch {
+            // Continue pushing remaining items in batch
+          }
+        }
+      })
+    );
+
+    return pushedTotal;
+  };
+
+  const handleStopAutoFolderLoop = () => {
+    stopFolderLoopRef.current = true;
+    showToast('Đang dừng quy trình quét thư mục tự động...');
+  };
+
+  const handleStartAutoFolderLoop = async () => {
+    if (isAutoFolderRunning || isProcessingAll) return;
+
+    const trimmedInput = folderPathInput.trim();
+    const useBrowserSource = Boolean(
+      (dirHandleRef.current || webkitSnapshotFilesRef.current) &&
+        (!trimmedInput || trimmedInput === pickedFolderName)
+    );
+
+    if (!useBrowserSource && !trimmedInput) {
+      showToast('Hãy nhập đường dẫn thư mục MP3 hoặc bấm "Chọn thư mục".');
+      return;
+    }
+
+    stopFolderLoopRef.current = false;
+    setIsAutoFolderRunning(true);
+    setFolderWarningMsg(null);
+
+    const sessionVisitedKeys = new Set<string>();
+    let batchNumber = 0;
+    let totalProcessed = 0;
+    let totalPushed = 0;
+    let totalErrors = 0;
+
+    try {
+      while (!stopFolderLoopRef.current) {
+        batchNumber++;
+        const latestHistory = await fetchFreshHistoryForScan();
+
+        if (useBrowserSource) {
+          setFolderRunStats({
+            source: 'browser',
+            batchNumber,
+            batchTotal: 0,
+            batchDone: 0,
+            totalProcessed,
+            totalPushed,
+            totalErrors,
+            totalSkipped: 0,
+            remainingInFolder: 0,
+            phaseLabel: `Đang quét thư mục (lần ${batchNumber}) & lọc bài trùng...`,
+          });
+
+          const scan = await collectBrowserBatch(latestHistory, sessionVisitedKeys);
+          if (scan.batchAudioFiles.length === 0) {
+            showToast(
+              batchNumber === 1
+                ? `Đã quét ${scan.totalAudioFiles} file — toàn bộ đều đã có trong lịch sử (đã lọc trùng).`
+                : `Hoàn tất tự động! Đã xử lý ${totalProcessed} bài mới (${totalPushed} bài đã đẩy App) và quét sạch thư mục.`
+            );
+            break;
+          }
+
+          for (const f of scan.batchAudioFiles) {
+            const fk = normalizeFileKey(f.name);
+            if (fk) sessionVisitedKeys.add(fk);
+            sessionVisitedKeys.add(f.name.toLowerCase());
+          }
+
+          // Read local audio hints in parallel (8 workers)
+          const hintedFiles = new Array<{ file: File; hints: Awaited<ReturnType<typeof readLocalAudioHints>> }>(
+            scan.batchAudioFiles.length
+          );
+          let hintIdx = 0;
+          await Promise.all(
+            Array.from({ length: Math.min(8, scan.batchAudioFiles.length) }).map(async () => {
+              while (hintIdx < scan.batchAudioFiles.length) {
+                const idx = hintIdx++;
+                const f = scan.batchAudioFiles[idx];
+                hintedFiles[idx] = { file: f, hints: await readLocalAudioHints(f) };
+              }
+            })
+          );
+
+          const batchEntries: LocalTrackEntry[] = hintedFiles.map(({ file, hints }) => {
+            const stem = file.name.replace(/\.[a-zA-Z0-9]{2,5}$/, '').toLowerCase().replace(/\s+/g, ' ').trim();
+            const guessed = guessTitleArtistFromName(file.name);
+            const pairedLrc = scan.lrcMap.get(stem);
+            const embeddedIsLrc = hints.lyrics ? /\[\d{1,2}:\d{2}/.test(hints.lyrics) : false;
+            return {
+              localId: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+              file,
+              fileName: file.name,
+              fileSizeBytes: file.size,
+              title: hints.title || guessed.title,
+              artist: hints.artist || guessed.artist,
+              album: hints.album || '',
+              coverUrl: '',
+              durationMs: hints.durationSec ? hints.durationSec * 1000 : 0,
+              syncedLyrics: pairedLrc?.syncedLyrics ?? (embeddedIsLrc ? hints.lyrics || null : null),
+              plainLyrics: pairedLrc?.plainLyrics ?? (hints.lyrics || null),
+              isEnriching: true,
+              enrichMatched: false,
+            };
+          });
+
+          setEntries(batchEntries);
+
+          let batchDoneCount = 0;
+          const batchCompletedJobs: DownloadJob[] = [];
+          const remainingAfterThisBatch = Math.max(0, scan.remainingCount - batchEntries.length);
+
+          setFolderRunStats({
+            source: 'browser',
+            batchNumber,
+            batchTotal: batchEntries.length,
+            batchDone: 0,
+            totalProcessed,
+            totalPushed,
+            totalErrors,
+            totalSkipped: scan.skippedCount,
+            remainingInFolder: remainingAfterThisBatch,
+            phaseLabel: `Lô #${batchNumber}: Đang tìm ảnh bìa, lyrics & gắn thẻ ${batchEntries.length} bài...`,
+          });
+
+          const queue = [...batchEntries];
+          const workerCount = Math.min(6, queue.length);
+          await Promise.all(
+            Array.from({ length: workerCount }).map(async () => {
+              while (queue.length > 0) {
+                if (stopFolderLoopRef.current) break;
+                const entry = queue.shift();
+                if (!entry) break;
+                const enriched = await enrichSingleEntry(entry.localId, {
+                  fileName: entry.fileName,
+                  title: entry.title,
+                  artist: entry.artist,
+                  album: entry.album || undefined,
+                  durationSec: entry.durationMs ? Math.round(entry.durationMs / 1000) : undefined,
+                });
+                if (stopFolderLoopRef.current) break;
+                const mergedEntry: LocalTrackEntry = enriched
+                  ? {
+                      ...entry,
+                      title: enriched.title || entry.title,
+                      artist: enriched.artist || entry.artist,
+                      album: enriched.album || entry.album,
+                      coverUrl: enriched.coverUrl || entry.coverUrl,
+                      durationMs: enriched.durationMs || entry.durationMs,
+                      syncedLyrics: enriched.syncedLyrics ?? entry.syncedLyrics,
+                      plainLyrics: enriched.plainLyrics ?? entry.plainLyrics,
+                      isEnriching: false,
+                    }
+                  : { ...entry, isEnriching: false };
+                const jobRes = await processSingleEntry(mergedEntry, false);
+                batchDoneCount++;
+                if (jobRes?.state === 'done') {
+                  totalProcessed++;
+                  batchCompletedJobs.push(jobRes);
+                } else {
+                  totalErrors++;
+                }
+                setFolderRunStats((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        batchDone: batchDoneCount,
+                        totalProcessed,
+                        totalErrors,
+                      }
+                    : prev
+                );
+              }
+            })
+          );
+
+          if (autoPushAfterBatch && webhookUrl.trim() && batchCompletedJobs.length > 0 && !stopFolderLoopRef.current) {
+            setFolderRunStats((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    phaseLabel: `Lô #${batchNumber}: Đang đẩy ${batchCompletedJobs.length} bài lên ${r2Enabled ? 'R2 & App' : 'App'}...`,
+                  }
+                : prev
+            );
+            const pushedNow = await pushBatchJobsParallel(batchCompletedJobs);
+            totalPushed += pushedNow;
+          }
+
+          await onSyncHistory().catch(() => {});
+
+          if (stopFolderLoopRef.current) break;
+          if (remainingAfterThisBatch === 0) {
+            showToast(
+              `Hoàn tất! Đã quét & tải xong ${totalProcessed} bài hát mới (${totalPushed} bài đã đẩy App).`
+            );
+            break;
+          }
+
+          setFolderRunStats((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  totalPushed,
+                  phaseLabel: `Xong lô #${batchNumber}, đang chuẩn bị quét 50 bài tiếp theo...`,
+                }
+              : prev
+          );
+          await new Promise((r) => setTimeout(r, 300));
+        } else {
+          // Server-side folder path scan mode (when Node.js backend runs on the same PC)
+          setFolderRunStats({
+            source: 'server',
+            batchNumber,
+            batchTotal: 0,
+            batchDone: 0,
+            totalProcessed,
+            totalPushed,
+            totalErrors,
+            totalSkipped: 0,
+            remainingInFolder: 0,
+            phaseLabel: `Đang quét đường dẫn "${trimmedInput}" trên máy chủ...`,
+          });
+
+          const scanRes = await apiFetch('/api/local/scan-folder', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              folderPath: trimmedInput,
+              limit: FOLDER_BATCH_SIZE,
+              excludeFileKeys: Array.from(sessionVisitedKeys),
+              skipDuplicates: true,
+            }),
+          });
+          const scanData = (await scanRes.json()) as {
+            isRemoteServerHint?: boolean;
+            error?: string;
+            totalAudioFiles?: number;
+            skippedDuplicateCount?: number;
+            remainingCount?: number;
+            batchFiles?: Array<{
+              filePath: string;
+              fileName: string;
+              fileSizeBytes: number;
+              lrcPath: string | null;
+            }>;
+          };
+
+          if (!scanRes.ok) {
+            const errMsg = scanData.error || 'Không thể quét thư mục từ máy chủ.';
+            setFolderWarningMsg(errMsg);
+            showToast(errMsg);
+            break;
+          }
+
+          const batchFiles = scanData.batchFiles || [];
+          const skippedCount = scanData.skippedDuplicateCount || 0;
+          const remainingCount = scanData.remainingCount || 0;
+
+          if (batchFiles.length === 0) {
+            showToast(
+              batchNumber === 1
+                ? `Đã quét ${scanData.totalAudioFiles || 0} file — tất cả đều đã có trong lịch sử.`
+                : `Hoàn tất! Đã xử lý ${totalProcessed} bài mới (${totalPushed} bài đã đẩy App) và quét sạch thư mục.`
+            );
+            break;
+          }
+
+          for (const bf of batchFiles) {
+            const fk = normalizeFileKey(bf.fileName);
+            if (fk) sessionVisitedKeys.add(fk);
+            sessionVisitedKeys.add(bf.fileName.toLowerCase());
+          }
+
+          const batchEntries: LocalTrackEntry[] = batchFiles.map((bf) => {
+            const guessed = guessTitleArtistFromName(bf.fileName);
+            return {
+              localId: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+              file: new File([], bf.fileName, { type: 'audio/mpeg' }),
+              fileName: bf.fileName,
+              fileSizeBytes: bf.fileSizeBytes,
+              title: guessed.title,
+              artist: guessed.artist,
+              album: '',
+              coverUrl: '',
+              durationMs: 0,
+              syncedLyrics: null,
+              plainLyrics: null,
+              isEnriching: true,
+              enrichMatched: false,
+            };
+          });
+          setEntries(batchEntries);
+
+          let batchDoneCount = 0;
+          const batchCompletedJobs: DownloadJob[] = [];
+          const remainingAfterThisBatch = Math.max(0, remainingCount - batchFiles.length);
+
+          setFolderRunStats({
+            source: 'server',
+            batchNumber,
+            batchTotal: batchFiles.length,
+            batchDone: 0,
+            totalProcessed,
+            totalPushed,
+            totalErrors,
+            totalSkipped: skippedCount,
+            remainingInFolder: remainingAfterThisBatch,
+            phaseLabel: `Lô #${batchNumber}: Đang xử lý trực tiếp ${batchFiles.length} bài trên máy chủ...`,
+          });
+
+          const pairedQueue = batchFiles.map((bf, idx) => ({ bf, localId: batchEntries[idx].localId }));
+          await Promise.all(
+            Array.from({ length: Math.min(6, pairedQueue.length) }).map(async () => {
+              while (pairedQueue.length > 0) {
+                if (stopFolderLoopRef.current) break;
+                const item = pairedQueue.shift();
+                if (!item) break;
+                try {
+                  const procRes = await apiFetch('/api/local/process-folder-file', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      filePath: item.bf.filePath,
+                      fileName: item.bf.fileName,
+                      lrcPath: item.bf.lrcPath,
+                      bitrate,
+                      embedTags,
+                    }),
+                  });
+                  const procData = (await procRes.json()) as { job?: DownloadJob; error?: string };
+                  if (procRes.ok && procData.job) {
+                    const doneJob = procData.job;
+                    setEntries((prev) =>
+                      prev.map((e) =>
+                        e.localId === item.localId
+                          ? {
+                              ...e,
+                              isEnriching: false,
+                              title: doneJob.title || e.title,
+                              artist: doneJob.artist || e.artist,
+                              album: doneJob.album || e.album,
+                              coverUrl: doneJob.coverUrl || e.coverUrl,
+                              durationMs: doneJob.durationMs || e.durationMs,
+                              syncedLyrics: doneJob.syncedLyrics ?? e.syncedLyrics,
+                              plainLyrics: doneJob.plainLyrics ?? e.plainLyrics,
+                              job: doneJob,
+                            }
+                          : e
+                      )
+                    );
+                    onJobsUpdated([doneJob]);
+                    if (doneJob.state === 'done') {
+                      totalProcessed++;
+                      batchCompletedJobs.push(doneJob);
+                    } else {
+                      totalErrors++;
+                    }
+                  } else {
+                    totalErrors++;
+                    setEntries((prev) =>
+                      prev.map((e) => (e.localId === item.localId ? { ...e, isEnriching: false } : e))
+                    );
+                  }
+                } catch {
+                  totalErrors++;
+                  setEntries((prev) =>
+                    prev.map((e) => (e.localId === item.localId ? { ...e, isEnriching: false } : e))
+                  );
+                } finally {
+                  batchDoneCount++;
+                  setFolderRunStats((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          batchDone: batchDoneCount,
+                          totalProcessed,
+                          totalErrors,
+                        }
+                      : prev
+                  );
+                }
+              }
+            })
+          );
+
+          if (autoPushAfterBatch && webhookUrl.trim() && batchCompletedJobs.length > 0 && !stopFolderLoopRef.current) {
+            setFolderRunStats((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    phaseLabel: `Lô #${batchNumber}: Đang đẩy ${batchCompletedJobs.length} bài lên ${r2Enabled ? 'R2 & App' : 'App'}...`,
+                  }
+                : prev
+            );
+            const pushedNow = await pushBatchJobsParallel(batchCompletedJobs);
+            totalPushed += pushedNow;
+          }
+
+          await onSyncHistory().catch(() => {});
+
+          if (stopFolderLoopRef.current) break;
+          if (remainingAfterThisBatch === 0) {
+            showToast(
+              `Hoàn tất! Đã quét & tải xong ${totalProcessed} bài hát mới (${totalPushed} bài đã đẩy App).`
+            );
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Lỗi khi quét thư mục tự động.';
+      setFolderWarningMsg(msg);
+      showToast(msg);
+    } finally {
+      setIsAutoFolderRunning(false);
+    }
+  };
+
   const editingLyricsEntry = entries.find((e) => e.localId === editingLyricsId) || null;
   const editingCoverEntry = entries.find((e) => e.localId === editingCoverId) || null;
   const pendingCount = entries.filter((e) => !e.job || e.job.state === 'error').length;
@@ -910,6 +1628,140 @@ export function LocalEnrichView({
     <div className="flex-1 flex flex-col min-w-0 w-full">
       {/* Dropzone & Batch Controls */}
       <div className="border-b border-white/[0.08] bg-[#111419] px-4 lg:px-5 py-4 space-y-3.5">
+        {/* 1-Line Auto-Folder Path & Batch-50 Scanner Bar */}
+        <div className="rounded-lg border border-white/[0.1] bg-[#090B0E] p-2.5 space-y-2">
+          <div className="flex flex-wrap lg:flex-nowrap items-center gap-2">
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              // @ts-expect-error webkitdirectory is supported in Chromium/WebKit/Firefox browsers
+              webkitdirectory=""
+              onChange={(e) => {
+                handleWebkitFolderSelected(e.target.files);
+                e.target.value = '';
+              }}
+              className="hidden"
+            />
+
+            <div className="relative flex-1 min-w-[220px] flex items-center">
+              <FolderOpen className="h-4 w-4 text-[#1DB954] absolute left-3 pointer-events-none shrink-0" />
+              <input
+                type="text"
+                value={folderPathInput}
+                disabled={isAutoFolderRunning}
+                onChange={(e) => updateFolderPathInput(e.target.value)}
+                placeholder="Nhập đường dẫn thư mục MP3 (vd: D:\Nhac\MP3) hoặc chọn thư mục..."
+                className="w-full h-9 rounded-md bg-[#141920] border border-white/[0.1] focus:border-[#1DB954]/60 focus:outline-none pl-9 pr-3 text-xs text-slate-100 placeholder:text-slate-500 font-mono disabled:opacity-60"
+              />
+              {pickedFolderName && !isAutoFolderRunning && (
+                <button
+                  type="button"
+                  onClick={handleClearPickedFolder}
+                  title={`Bỏ chọn thư mục "${pickedFolderName}"`}
+                  className="absolute right-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#1DB954]/15 border border-[#1DB954]/30 text-[11px] text-[#6ee79c] hover:bg-[#1DB954]/25 cursor-pointer"
+                >
+                  <span className="max-w-[110px] truncate">{pickedFolderName}</span>
+                  <X className="h-3 w-3" />
+                </button>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={handlePickLocalFolder}
+              disabled={isAutoFolderRunning}
+              title="Cấp quyền trình duyệt đọc thư mục MP3 trên máy (hỗ trợ cả khi server chạy trên Render)"
+              className="h-9 px-3 rounded-md border border-white/[0.12] bg-white/[0.05] hover:bg-white/[0.1] disabled:opacity-45 text-xs font-medium text-slate-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <FolderOpen className="h-3.5 w-3.5 text-[#1DB954]" />
+              <span>Chọn thư mục</span>
+            </button>
+
+            <label
+              title="Tự động đẩy lên R2 & App Nhạc ngay sau mỗi lượt 50 bài"
+              className="h-9 px-2.5 rounded-md border border-white/[0.08] bg-[#141920] inline-flex items-center gap-1.5 text-xs text-slate-300 select-none cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <input
+                type="checkbox"
+                checked={autoPushAfterBatch}
+                disabled={isAutoFolderRunning}
+                onChange={(e) => {
+                  const val = e.target.checked;
+                  setAutoPushAfterBatch(val);
+                  try {
+                    localStorage.setItem('spotflow_folder_auto_push', String(val));
+                  } catch {
+                    // Ignore
+                  }
+                }}
+                className="accent-[#1DB954] h-3.5 w-3.5 rounded cursor-pointer"
+              />
+              <span>Tự đẩy App</span>
+            </label>
+
+            {isAutoFolderRunning ? (
+              <button
+                type="button"
+                onClick={handleStopAutoFolderLoop}
+                className="h-9 px-3.5 rounded-md bg-red-500/20 border border-red-500/40 hover:bg-red-500/30 text-red-200 text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+                <span>Dừng tự động</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleStartAutoFolderLoop}
+                disabled={isProcessingAll}
+                className="h-9 px-3.5 rounded-md bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-45 text-[#090B0E] text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Play className="h-3.5 w-3.5 fill-current" />
+                <span>Quét &amp; Tải 50 bài/lượt</span>
+              </button>
+            )}
+          </div>
+
+          {folderRunStats && (
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-white/[0.06] text-xs">
+              <div className="flex items-center gap-2 text-slate-200 min-w-0">
+                {isAutoFolderRunning ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#1DB954] shrink-0" />
+                ) : (
+                  <Check className="h-3.5 w-3.5 text-[#1DB954] shrink-0" />
+                )}
+                <span className="truncate">{folderRunStats.phaseLabel}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 font-mono text-[11px] text-slate-400 shrink-0">
+                <span className="text-[#1DB954]">
+                  Lô #{folderRunStats.batchNumber}: {folderRunStats.batchDone}/{folderRunStats.batchTotal}
+                </span>
+                <span>Đã lọc trùng: {folderRunStats.totalSkipped}</span>
+                <span>Còn lại trong thư mục: {folderRunStats.remainingInFolder}</span>
+                <span className="text-white">
+                  Tổng xong: {folderRunStats.totalProcessed} · Đã đẩy: {folderRunStats.totalPushed}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {folderWarningMsg && (
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-amber-500/20 text-xs text-amber-300">
+              <span className="flex items-center gap-1.5 min-w-0">
+                <AlertCircle className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                <span>{folderWarningMsg}</span>
+              </span>
+              <button
+                type="button"
+                onClick={handlePickLocalFolder}
+                className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0E] font-semibold text-xs shrink-0 cursor-pointer"
+              >
+                Chọn thư mục trên máy ngay
+              </button>
+            </div>
+          )}
+        </div>
+
         <div
           onDragOver={(e) => {
             e.preventDefault();

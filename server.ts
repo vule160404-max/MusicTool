@@ -2309,6 +2309,206 @@ async function startServer() {
     }
   );
 
+  app.post('/api/local/scan-folder', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {
+        folderPath?: string;
+        limit?: number;
+        excludeFileKeys?: string[];
+        skipDuplicates?: boolean;
+      };
+
+      const rawPath = (body.folderPath || '').trim().replace(/^["']|["']$/g, '');
+      if (!rawPath) {
+        res.status(400).json({ error: 'Vui lòng nhập đường dẫn thư mục chứa file MP3.' });
+        return;
+      }
+
+      const resolvedPath = path.resolve(rawPath);
+      const isWindowsDrivePath = /^[a-zA-Z]:[\\/]/.test(rawPath);
+      if (!fs.existsSync(resolvedPath)) {
+        const isRemoteHint = process.platform !== 'win32' && isWindowsDrivePath;
+        res.status(400).json({
+          isRemoteServerHint: isRemoteHint,
+          error: isRemoteHint
+            ? `Máy chủ Node.js đang chạy trên Cloud (${process.platform}) nên không thể truy cập trực tiếp ổ đĩa "${rawPath}" trên máy Windows của bạn. Hãy bấm nút "Chọn thư mục" bên cạnh để cấp quyền trình duyệt đọc thẳng thư mục trên máy!`
+            : `Không tìm thấy thư mục: ${resolvedPath}`,
+        });
+        return;
+      }
+
+      const stat = await fsp.stat(resolvedPath);
+      if (!stat.isDirectory()) {
+        res.status(400).json({ error: 'Đường dẫn đã nhập không phải là một thư mục hợp lệ.' });
+        return;
+      }
+
+      const limit = Math.min(100, Math.max(1, Number(body.limit) || 50));
+      const skipDuplicates = body.skipDuplicates !== false;
+      const excludeSet = new Set(
+        (Array.isArray(body.excludeFileKeys) ? body.excludeFileKeys : []).map((k) =>
+          String(k).trim().toLowerCase()
+        )
+      );
+
+      const audioFiles: Array<{ filePath: string; fileName: string; fileSizeBytes: number; stem: string }> = [];
+      const lyricStems = new Map<string, string>();
+
+      const walkDir = async (dir: string, depth: number) => {
+        if (depth > 3) return;
+        const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            await walkDir(full, depth + 1);
+          } else if (entry.isFile()) {
+            if (/\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(entry.name)) {
+              const st = await fsp.stat(full).catch(() => null);
+              if (st && st.size > 0) {
+                audioFiles.push({
+                  filePath: full,
+                  fileName: entry.name,
+                  fileSizeBytes: st.size,
+                  stem: entry.name.replace(/\.[a-zA-Z0-9]{2,5}$/, '').toLowerCase().replace(/\s+/g, ' ').trim(),
+                });
+              }
+            } else if (/\.(lrc|txt)$/i.test(entry.name)) {
+              const stem = entry.name.replace(/\.[a-zA-Z0-9]{2,5}$/, '').toLowerCase().replace(/\s+/g, ' ').trim();
+              if (stem && !lyricStems.has(stem)) {
+                lyricStems.set(stem, full);
+              }
+            }
+          }
+        }
+      };
+
+      await walkDir(resolvedPath, 0);
+      audioFiles.sort((a, b) => a.fileName.localeCompare(b.fileName, 'vi'));
+
+      const historyFileKeys = new Set(uploadHistory.map((h) => h.fileKey).filter(Boolean));
+      const historyTrackKeys = new Set(uploadHistory.map((h) => h.trackKey).filter(Boolean));
+
+      let skippedDuplicateCount = 0;
+      const remaining: Array<{ filePath: string; fileName: string; fileSizeBytes: number; lrcPath: string | null }> = [];
+
+      for (const item of audioFiles) {
+        const fKey = buildFileKeyServer(item.fileName);
+        const rawLower = item.fileName.toLowerCase();
+        if (excludeSet.has(fKey) || excludeSet.has(rawLower)) {
+          skippedDuplicateCount++;
+          continue;
+        }
+        if (skipDuplicates) {
+          const parsed = parseTrackFilename(item.fileName);
+          const tKey = buildTrackKeyServer(parsed.title, parsed.artist);
+          if ((fKey && historyFileKeys.has(fKey)) || (tKey && historyTrackKeys.has(tKey))) {
+            skippedDuplicateCount++;
+            continue;
+          }
+        }
+        remaining.push({
+          filePath: item.filePath,
+          fileName: item.fileName,
+          fileSizeBytes: item.fileSizeBytes,
+          lrcPath: lyricStems.get(item.stem) || null,
+        });
+      }
+
+      res.json({
+        folderPath: resolvedPath,
+        totalAudioFiles: audioFiles.length,
+        skippedDuplicateCount,
+        remainingCount: remaining.length,
+        batchFiles: remaining.slice(0, limit),
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Không thể quét thư mục trên máy chủ.',
+      });
+    }
+  });
+
+  app.post('/api/local/process-folder-file', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {
+        filePath?: string;
+        fileName?: string;
+        lrcPath?: string | null;
+        bitrate?: number;
+        embedTags?: boolean;
+      };
+
+      const rawFilePath = (body.filePath || '').trim();
+      if (!rawFilePath || !fs.existsSync(rawFilePath)) {
+        res.status(404).json({ error: 'Không tìm thấy file âm thanh tại đường dẫn đã quét.' });
+        return;
+      }
+
+      const fileBuf = await fsp.readFile(rawFilePath);
+      const fileName = (body.fileName || path.basename(rawFilePath)).trim();
+      const parsed = parseTrackFilename(fileName);
+      const bitrate = [192, 256, 320].includes(Number(body.bitrate)) ? Number(body.bitrate) : 320;
+      const embedTags = body.embedTags !== false;
+      const extMatch = fileName.match(/\.([a-zA-Z0-9]{2,5})$/);
+      const ext = extMatch ? extMatch[1].toLowerCase() : 'mp3';
+
+      let syncedLyrics: string | null = null;
+      let plainLyrics: string | null = null;
+      if (body.lrcPath && fs.existsSync(body.lrcPath)) {
+        try {
+          const lrcText = (await fsp.readFile(body.lrcPath, 'utf8')).trim();
+          if (lrcText.length > 10) {
+            const isLrc = /\[\d{1,2}:\d{2}/.test(lrcText);
+            syncedLyrics = isLrc ? lrcText : null;
+            plainLyrics = isLrc ? lrcToPlainText(lrcText) : lrcText;
+          }
+        } catch {
+          // Ignore unreadable sidecar lyric file
+        }
+      }
+
+      const jobId = crypto.randomBytes(8).toString('hex');
+      const trackId = `local_${crypto.randomBytes(6).toString('hex')}`;
+      const reqHost = req.get('host') || 'localhost:3000';
+      const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+
+      const job: DownloadJob = {
+        jobId,
+        trackId,
+        title: parsed.title || 'Unknown Track',
+        artist: parsed.artist || 'Unknown Artist',
+        album: 'Local Folder',
+        bitrate,
+        state: 'converting',
+        progress: 30,
+        message: 'Đang đọc file từ thư mục & gắn thẻ...',
+        filePath: null,
+        fileName,
+        sourceFileName: fileName,
+        fileSizeBytes: fileBuf.length,
+        error: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        syncedLyrics,
+        plainLyrics,
+        coverUrl: null,
+        durationMs: 0,
+        alreadyEnriched: false,
+        webhookStatus: 'idle',
+        webhookMessage: null,
+        pushedAt: null,
+      };
+
+      jobs.set(jobId, job);
+      await processLocalUploadJob(job, fileBuf, ext, embedTags, reqHost, reqProtocol);
+      res.json({ completed: true, job: { ...job, filePath: null } });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Lỗi xử lý file từ thư mục.',
+      });
+    }
+  });
+
   app.post('/api/download/statuses', (req: Request, res: Response) => {
     const body = req.body as { jobIds?: string[] };
     const ids = Array.isArray(body.jobIds) ? body.jobIds : [];
