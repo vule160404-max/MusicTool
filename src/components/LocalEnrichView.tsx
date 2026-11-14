@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
   Download,
+  ExternalLink,
   FileArchive,
   FileAudio,
   FolderOpen,
@@ -29,6 +30,11 @@ import type {
   UploadHistoryItem,
 } from '../types';
 import { apiFetch, getBackendBaseUrl } from '../utils/api';
+import {
+  DirectR2UnavailableError,
+  isDirectR2Mp3Candidate,
+  processEntryDirectToR2,
+} from '../utils/clientR2Upload';
 import { readLocalAudioHints } from '../utils/localAudioHints';
 import {
   findDuplicateHistoryMatch,
@@ -53,6 +59,16 @@ interface BrowserDirHandle {
   kind: 'directory';
   name: string;
   values: () => AsyncIterable<BrowserFileHandle | BrowserDirHandle>;
+}
+
+interface FsEntryLike {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+  file?: (cb: (f: File) => void, err?: (e: unknown) => void) => void;
+  createReader?: () => {
+    readEntries: (cb: (entries: FsEntryLike[]) => void, err?: (e: unknown) => void) => void;
+  };
 }
 
 interface FolderRunStats {
@@ -185,13 +201,30 @@ export function LocalEnrichView({
   const [isAutoFolderRunning, setIsAutoFolderRunning] = useState<boolean>(false);
   const [folderRunStats, setFolderRunStats] = useState<FolderRunStats | null>(null);
   const [folderWarningMsg, setFolderWarningMsg] = useState<string | null>(null);
+  const [serverPlatform, setServerPlatform] = useState<string | null>(null);
+  const [isDraggingFolderBar, setIsDraggingFolderBar] = useState<boolean>(false);
+
+  const folderInputId = useId();
+  const multiFileFolderInputId = useId();
+  const isInsideIframe = useMemo(() => {
+    try {
+      return typeof window !== 'undefined' && window.self !== window.top;
+    } catch {
+      return true;
+    }
+  }, []);
 
   const dirHandleRef = useRef<BrowserDirHandle | null>(null);
   const webkitSnapshotFilesRef = useRef<File[] | null>(null);
   const stopFolderLoopRef = useRef<boolean>(false);
   const autoStartAfterPickRef = useRef<boolean>(false);
+  const directR2FailedRef = useRef<boolean>(false);
   const historyItemsRef = useRef<UploadHistoryItem[]>(historyItems);
   historyItemsRef.current = historyItems;
+
+  useEffect(() => {
+    if (r2Enabled) directR2FailedRef.current = false;
+  }, [r2Enabled]);
 
   const autoDownloadRef = useRef(autoDownloadEach);
   autoDownloadRef.current = autoDownloadEach;
@@ -225,6 +258,19 @@ export function LocalEnrichView({
       return changed ? next : prev;
     });
   }, [completedJobs]);
+
+  useEffect(() => {
+    let active = true;
+    apiFetch('/api/health')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { platform?: string } | null) => {
+        if (active && d?.platform) setServerPlatform(d.platform);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     const totalBytes = entries.reduce(
@@ -333,8 +379,10 @@ export function LocalEnrichView({
 
   const processSingleEntry = async (
     entry: LocalTrackEntry,
-    syncHistoryAfter = true
+    syncHistoryAfter = true,
+    autoPushThisTrack = false
   ): Promise<DownloadJob | null> => {
+    const canTryDirectR2 = r2Enabled && !directR2FailedRef.current && isDirectR2Mp3Candidate(entry.file);
     const optimisticJob: DownloadJob = {
       jobId: `pending_${entry.localId}`,
       trackId: entry.localId,
@@ -344,7 +392,9 @@ export function LocalEnrichView({
       bitrate,
       state: 'converting',
       progress: 45,
-      message: 'Đang gửi & gắn thẻ MP3...',
+      message: canTryDirectR2
+        ? 'Đang gắn thẻ ID3 & đẩy thẳng lên R2...'
+        : 'Đang gửi & gắn thẻ MP3...',
       fileName: entry.fileName,
       fileSizeBytes: entry.fileSizeBytes,
       error: null,
@@ -352,6 +402,70 @@ export function LocalEnrichView({
     setEntries((prev) =>
       prev.map((e) => (e.localId === entry.localId ? { ...e, job: optimisticJob } : e))
     );
+
+    if (canTryDirectR2) {
+      try {
+        const directJob = await processEntryDirectToR2(entry, {
+          embedTags,
+          autoPush: autoPushThisTrack,
+          webhookUrl: webhookUrl.trim(),
+        });
+        setEntries((prev) =>
+          prev.map((e) =>
+            e.localId === entry.localId
+              ? {
+                  ...e,
+                  job: directJob,
+                  coverUrl: directJob.coverUrl || e.coverUrl,
+                  durationMs: directJob.durationMs || e.durationMs,
+                  syncedLyrics: directJob.syncedLyrics ?? e.syncedLyrics,
+                  plainLyrics: directJob.plainLyrics ?? e.plainLyrics,
+                }
+              : e
+          )
+        );
+        if (directJob.state === 'done' && autoDownloadRef.current && !autoSavedRef.current.has(directJob.jobId)) {
+          autoSavedRef.current.add(directJob.jobId);
+          triggerSaveJobFile(directJob);
+        }
+        onJobsUpdated([directJob]);
+        if (directJob.state === 'done' && syncHistoryAfter) {
+          onSyncHistory().catch(() => {});
+        }
+        return directJob;
+      } catch (err) {
+        if (err instanceof DirectR2UnavailableError) {
+          directR2FailedRef.current = true;
+          setEntries((prev) =>
+            prev.map((e) =>
+              e.localId === entry.localId && e.job
+                ? { ...e, job: { ...e.job, message: 'Đang chuyển sang máy chủ xử lý...' } }
+                : e
+            )
+          );
+        } else {
+          const errMsg = err instanceof Error ? err.message : 'Lỗi đẩy thẳng R2';
+          const failedJob: DownloadJob = {
+            jobId: `err_${entry.localId}`,
+            trackId: entry.localId,
+            title: entry.title,
+            artist: entry.artist,
+            album: entry.album,
+            bitrate,
+            state: 'error',
+            progress: 0,
+            message: errMsg,
+            fileName: entry.fileName,
+            fileSizeBytes: entry.fileSizeBytes,
+            error: errMsg,
+          };
+          setEntries((prev) =>
+            prev.map((e) => (e.localId === entry.localId ? { ...e, job: failedJob } : e))
+          );
+          return failedJob;
+        }
+      }
+    }
 
     try {
       const metaJson = JSON.stringify({
@@ -662,7 +776,8 @@ export function LocalEnrichView({
     let doneCount = 0;
     try {
       const queue = [...targets];
-      const processWorkers = Math.max(5, Math.min(8, (pushConcurrency || 4) + 2));
+      const useDirectR2 = r2Enabled && !directR2FailedRef.current;
+      const processWorkers = useDirectR2 ? 4 : 2;
       const workers = Array.from({ length: Math.min(processWorkers, queue.length) }).map(async () => {
         while (queue.length > 0) {
           const item = queue.shift();
@@ -1066,6 +1181,127 @@ export function LocalEnrichView({
     }
   };
 
+  const handleMultiFileFolderSelected = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) {
+      autoStartAfterPickRef.current = false;
+      return;
+    }
+    const files = Array.from(fileList);
+    const audioCount = files.filter((f) => /\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(f.name)).length;
+    if (audioCount === 0) {
+      autoStartAfterPickRef.current = false;
+      const msg = 'Không có file âm thanh (.mp3, .m4a, .wav, .flac...) nào trong danh sách vừa chọn.';
+      setFolderWarningMsg(msg);
+      showToast(msg);
+      return;
+    }
+
+    const typedTail = folderPathInput
+      .trim()
+      .replace(/^["']+|["']+$/g, '')
+      .replace(/[\\/]+$/, '')
+      .split(/[\\/]/)
+      .pop();
+    const labelName = typedTail || `${audioCount} bài đã chọn`;
+
+    dirHandleRef.current = null;
+    webkitSnapshotFilesRef.current = files;
+    setPickedFolderName(labelName);
+    setFolderWarningMsg(null);
+
+    if (autoStartAfterPickRef.current) {
+      autoStartAfterPickRef.current = false;
+      showToast(`Đã nạp ${audioCount} bài nhạc — đang tự động lọc trùng & tải 50 bài/lượt...`);
+      void handleStartAutoFolderLoop(true);
+    } else {
+      showToast(`Đã nạp ${audioCount} bài nhạc (${labelName}). Bấm "Quét & Tải 50 bài/lượt" để chạy.`);
+    }
+  };
+
+  const handleDropDataTransfer = async (dataTransfer: DataTransfer, autoStartBatchMode: boolean) => {
+    // Extract FileSystemEntry handles SYNCHRONOUSLY before any await
+    const itemEntries: FsEntryLike[] = [];
+    if (dataTransfer.items) {
+      for (const item of Array.from(dataTransfer.items)) {
+        const withEntry = item as DataTransferItem & { webkitGetAsEntry?: () => FsEntryLike | null };
+        const entry = withEntry.webkitGetAsEntry?.();
+        if (entry) itemEntries.push(entry);
+      }
+    }
+    const fallbackFiles = Array.from(dataTransfer.files || []);
+
+    const collectedFiles: File[] = [];
+    let droppedDirName: string | null = null;
+    let hasDirectory = false;
+
+    const readEntryRecursive = async (entry: FsEntryLike, depth: number): Promise<void> => {
+      if (depth > 4) return;
+      if (entry.isFile && typeof entry.file === 'function') {
+        const f = await new Promise<File | null>((resolve) => {
+          entry.file?.((file) => resolve(file), () => resolve(null));
+        });
+        if (f) collectedFiles.push(f);
+      } else if (entry.isDirectory && typeof entry.createReader === 'function') {
+        hasDirectory = true;
+        if (!droppedDirName) droppedDirName = entry.name;
+        const reader = entry.createReader();
+        const children: FsEntryLike[] = [];
+        // Chromium readEntries returns up to 100 entries per call; loop until empty
+        while (true) {
+          const chunk = await new Promise<FsEntryLike[]>((resolve) => {
+            reader.readEntries((res) => resolve(res || []), () => resolve([]));
+          });
+          if (!chunk || chunk.length === 0) break;
+          children.push(...chunk);
+        }
+        for (const child of children) {
+          await readEntryRecursive(child, depth + 1);
+        }
+      }
+    };
+
+    if (itemEntries.length > 0) {
+      for (const entry of itemEntries) {
+        await readEntryRecursive(entry, 0);
+      }
+    }
+
+    const finalFiles = collectedFiles.length > 0 ? collectedFiles : fallbackFiles;
+    const audioFiles = finalFiles.filter((f) => /\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(f.name));
+
+    if (hasDirectory || autoStartBatchMode || audioFiles.length > FOLDER_BATCH_SIZE) {
+      if (audioFiles.length === 0) {
+        const emptyMsg = droppedDirName
+          ? `Thư mục "${droppedDirName}" chưa có file âm thanh (.mp3, .m4a, .wav, .flac...) nào.`
+          : 'Không tìm thấy file âm thanh (.mp3, .m4a, .wav, .flac...) nào.';
+        setFolderWarningMsg(emptyMsg);
+        showToast(emptyMsg);
+        return;
+      }
+
+      const typedTail = folderPathInput
+        .trim()
+        .replace(/^["']+|["']+$/g, '')
+        .replace(/[\\/]+$/, '')
+        .split(/[\\/]/)
+        .pop();
+      const folderLabel = droppedDirName || typedTail || `${audioFiles.length} file nhạc`;
+
+      dirHandleRef.current = null;
+      webkitSnapshotFilesRef.current = finalFiles;
+      setPickedFolderName(folderLabel);
+      if (droppedDirName) {
+        syncFolderInputKeepingFullPath(droppedDirName);
+      }
+      setFolderWarningMsg(null);
+      showToast(`Đã nhận "${folderLabel}" (${audioFiles.length} bài nhạc) — đang tự động quét 50 bài/lượt...`);
+      void handleStartAutoFolderLoop(true);
+      return;
+    }
+
+    handleFilesSelected(finalFiles);
+  };
+
   const fetchFreshHistoryForScan = async (): Promise<UploadHistoryItem[]> => {
     try {
       const res = await apiFetch('/api/history');
@@ -1380,6 +1616,7 @@ export function LocalEnrichView({
           const batchCompletedJobs: DownloadJob[] = [];
           const remainingAfterThisBatch = Math.max(0, scan.remainingCount - batchEntries.length);
 
+          const useDirectR2Mode = r2Enabled && !directR2FailedRef.current;
           setFolderRunStats({
             source: 'browser',
             batchNumber,
@@ -1390,11 +1627,14 @@ export function LocalEnrichView({
             totalErrors,
             totalSkipped: scan.skippedCount,
             remainingInFolder: remainingAfterThisBatch,
-            phaseLabel: `Lô #${batchNumber}: Đang tìm ảnh bìa, lyrics & gắn thẻ ${batchEntries.length} bài...`,
+            phaseLabel: `Lô #${batchNumber}: Đang ${
+              useDirectR2Mode ? 'gắn thẻ & đẩy thẳng R2 (không qua Render)' : 'tìm ảnh bìa, lyrics & xử lý an toàn'
+            } ${batchEntries.length} bài...`,
           });
 
           const queue = [...batchEntries];
-          const workerCount = Math.min(6, queue.length);
+          const workerCount = Math.min(useDirectR2Mode ? 4 : 2, queue.length);
+          const autoPushInDirect = Boolean(autoPushAfterBatch && webhookUrl.trim());
           await Promise.all(
             Array.from({ length: workerCount }).map(async () => {
               while (queue.length > 0) {
@@ -1422,11 +1662,15 @@ export function LocalEnrichView({
                       isEnriching: false,
                     }
                   : { ...entry, isEnriching: false };
-                const jobRes = await processSingleEntry(mergedEntry, false);
+                const jobRes = await processSingleEntry(mergedEntry, false, autoPushInDirect);
                 batchDoneCount++;
                 if (jobRes?.state === 'done') {
                   totalProcessed++;
-                  batchCompletedJobs.push(jobRes);
+                  if (jobRes.webhookStatus === 'pushed') {
+                    totalPushed++;
+                  } else {
+                    batchCompletedJobs.push(jobRes);
+                  }
                 } else {
                   totalErrors++;
                 }
@@ -1436,6 +1680,7 @@ export function LocalEnrichView({
                         ...prev,
                         batchDone: batchDoneCount,
                         totalProcessed,
+                        totalPushed,
                         totalErrors,
                       }
                     : prev
@@ -1699,24 +1944,103 @@ export function LocalEnrichView({
   const pendingCount = entries.filter((e) => !e.job || e.job.state === 'error').length;
   const missingLyricsCount = entries.filter((e) => !e.syncedLyrics && !e.plainLyrics && !e.isEnriching).length;
 
+  const trimmedPathPreview = folderPathInput
+    .trim()
+    .replace(/^["']+|["']+$/g, '')
+    .replace(/[\\/]+$/, '');
+  const isWindowsPathOnCloud = Boolean(
+    serverPlatform &&
+      serverPlatform !== 'win32' &&
+      !pickedFolderName &&
+      (/^[a-zA-Z]:[\\/]/.test(trimmedPathPreview) || /^\\\\/.test(trimmedPathPreview))
+  );
+  const handleDownloadWindowsSyncBat = () => {
+    const base = getBackendBaseUrl() || (typeof window !== 'undefined' ? window.location.origin : '');
+    const folder =
+      trimmedPathPreview || 'C:\\Users\\vule1\\Music\\Spotify Downloader';
+    const params = new URLSearchParams({
+      folderPath: folder,
+      serverUrl: base,
+      webhookUrl: webhookUrl.trim(),
+    });
+    const a = document.createElement('a');
+    a.href = `${base}/api/local/windows-sync-bundle?${params.toString()}`;
+    a.download = 'SpotFlow-AutoSync.bat';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    if (typeof window !== 'undefined' && window.location.hostname.includes('run.app')) {
+      showToast(
+        'Đã tải SpotFlow-AutoSync.bat! Lưu ý: Để chạy tool từ máy Windows không vướng đăng nhập Google, hãy tải bản .bat từ link Render đã deploy của bạn.'
+      );
+    } else {
+      showToast(
+        'Đã tải SpotFlow-AutoSync.bat! Nháy đúp file này trên Windows để tự quét 50 bài/lượt & đẩy thẳng lên R2 (không qua Render).'
+      );
+    }
+  };
+
+  const activeFolderNotice =
+    folderWarningMsg ||
+    (isWindowsPathOnCloud && !isAutoFolderRunning
+      ? `Máy chủ Cloud (${serverPlatform}) không tự đọc ổ "${trimmedPathPreview}" chỉ từ chữ dán vào. Hãy tải Tool Windows (.bat) chạy tại máy để đẩy thẳng lên R2 (không nghẽn Render), hoặc kéo thả thư mục / chọn file:`
+      : null);
+
   return (
     <div className="flex-1 flex flex-col min-w-0 w-full">
       {/* Dropzone & Batch Controls */}
       <div className="border-b border-white/[0.08] bg-[#111419] px-4 lg:px-5 py-4 space-y-3.5">
-        {/* 1-Line Auto-Folder Path & Batch-50 Scanner Bar */}
-        <div className="rounded-lg border border-white/[0.1] bg-[#090B0E] p-2.5 space-y-2">
+        {/* 1-Line Auto-Folder Path & Batch-50 Scanner Bar (also accepts Folder Drag & Drop!) */}
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!isAutoFolderRunning) setIsDraggingFolderBar(true);
+          }}
+          onDragLeave={(e) => {
+            e.stopPropagation();
+            setIsDraggingFolderBar(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setIsDraggingFolderBar(false);
+            if (!isAutoFolderRunning) {
+              void handleDropDataTransfer(e.dataTransfer, true);
+            }
+          }}
+          className={`rounded-lg border p-2.5 space-y-2 transition-colors ${
+            isDraggingFolderBar
+              ? 'border-[#1DB954] bg-[#1DB954]/10'
+              : 'border-white/[0.1] bg-[#090B0E]'
+          }`}
+        >
           <div className="flex flex-wrap lg:flex-nowrap items-center gap-2">
             <input
+              id={folderInputId}
               ref={folderInputRef}
               type="file"
               multiple
               // @ts-expect-error webkitdirectory is supported in Chromium/WebKit/Firefox browsers
               webkitdirectory=""
+              directory=""
               onChange={(e) => {
                 handleWebkitFolderSelected(e.target.files);
                 e.target.value = '';
               }}
-              className="hidden"
+              className="sr-only"
+            />
+            <input
+              id={multiFileFolderInputId}
+              type="file"
+              multiple
+              accept=".mp3,.m4a,.wav,.ogg,.flac,.mp4,.webm,.mkv,.lrc,.txt,audio/*,video/*"
+              onChange={(e) => {
+                handleMultiFileFolderSelected(e.target.files);
+                e.target.value = '';
+              }}
+              className="sr-only"
             />
 
             <div className="flex-1 min-w-[220px] flex items-center h-9 rounded-md bg-[#141920] border border-white/[0.1] focus-within:border-[#1DB954]/60 px-2.5 gap-2">
@@ -1726,7 +2050,7 @@ export function LocalEnrichView({
                 value={folderPathInput}
                 disabled={isAutoFolderRunning}
                 onChange={(e) => updateFolderPathInput(e.target.value)}
-                placeholder="Nhập đường dẫn thư mục MP3 (vd: C:\Users\...\Music) hoặc chọn thư mục..."
+                placeholder="Dán đường dẫn hoặc kéo thả cả thư mục MP3 vào đây..."
                 className="flex-1 min-w-0 bg-transparent text-xs text-slate-100 placeholder:text-slate-500 font-mono focus:outline-none disabled:opacity-60"
               />
               {pickedFolderName && !isAutoFolderRunning && (
@@ -1743,15 +2067,45 @@ export function LocalEnrichView({
               )}
             </div>
 
+            {isInsideIframe ? (
+              <label
+                htmlFor={isAutoFolderRunning ? undefined : folderInputId}
+                onClick={() => {
+                  if (!isAutoFolderRunning) {
+                    autoStartAfterPickRef.current = false;
+                    setFolderWarningMsg(null);
+                  }
+                }}
+                title="Chọn thư mục MP3 trên máy tính (nếu bị chặn trong khung xem trước, hãy kéo thả cả thư mục vào thanh này hoặc Mở tab riêng)"
+                className={`h-9 px-3 rounded-md border border-white/[0.12] bg-white/[0.05] hover:bg-white/[0.1] text-xs font-medium text-slate-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                  isAutoFolderRunning ? 'opacity-45 pointer-events-none' : ''
+                }`}
+              >
+                <FolderOpen className="h-3.5 w-3.5 text-[#1DB954]" />
+                <span>Chọn thư mục</span>
+              </label>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void handlePickLocalFolder(false)}
+                disabled={isAutoFolderRunning}
+                title="Cấp quyền trình duyệt đọc thư mục MP3 trên máy (đẩy thẳng R2 không qua Render)"
+                className="h-9 px-3 rounded-md border border-white/[0.12] bg-white/[0.05] hover:bg-white/[0.1] disabled:opacity-45 text-xs font-medium text-slate-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <FolderOpen className="h-3.5 w-3.5 text-[#1DB954]" />
+                <span>Chọn thư mục</span>
+              </button>
+            )}
+
             <button
               type="button"
-              onClick={() => void handlePickLocalFolder(false)}
+              onClick={handleDownloadWindowsSyncBat}
               disabled={isAutoFolderRunning}
-              title="Cấp quyền trình duyệt đọc thư mục MP3 trên máy (hỗ trợ cả khi server chạy trên Render)"
-              className="h-9 px-3 rounded-md border border-white/[0.12] bg-white/[0.05] hover:bg-white/[0.1] disabled:opacity-45 text-xs font-medium text-slate-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+              title="Tải file SpotFlow-AutoSync.bat chạy trên máy Windows: tự quét thư mục đã nhập, lọc trùng 50 bài/lượt và đẩy thẳng lên R2 (0% tải cho Render!)"
+              className="h-9 px-2.5 rounded-md border border-sky-500/35 bg-sky-500/10 hover:bg-sky-500/20 disabled:opacity-45 text-xs font-medium text-sky-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
             >
-              <FolderOpen className="h-3.5 w-3.5 text-[#1DB954]" />
-              <span>Chọn thư mục</span>
+              <Download className="h-3.5 w-3.5 text-sky-400" />
+              <span>Tool PC (.bat)</span>
             </button>
 
             <label
@@ -1821,19 +2175,63 @@ export function LocalEnrichView({
             </div>
           )}
 
-          {folderWarningMsg && (
+          {activeFolderNotice && (
             <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-amber-500/20 text-xs text-amber-300">
-              <span className="flex items-center gap-1.5 min-w-0">
+              <span className="flex items-center gap-1.5 min-w-0 flex-1">
                 <AlertCircle className="h-3.5 w-3.5 text-amber-400 shrink-0" />
-                <span>{folderWarningMsg}</span>
+                <span>{activeFolderNotice}</span>
               </span>
-              <button
-                type="button"
-                onClick={() => void handlePickLocalFolder(true)}
-                className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0E] font-semibold text-xs shrink-0 cursor-pointer"
-              >
-                Chọn thư mục trên máy ngay
-              </button>
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleDownloadWindowsSyncBat}
+                  className="px-2.5 py-1 rounded bg-sky-500 hover:bg-sky-400 text-[#090B0E] font-semibold text-xs inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <Download className="h-3 w-3" />
+                  <span>Tải Tool PC (.bat)</span>
+                </button>
+                {isInsideIframe ? (
+                  <label
+                    htmlFor={folderInputId}
+                    onClick={() => {
+                      autoStartAfterPickRef.current = true;
+                    }}
+                    className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0E] font-semibold text-xs cursor-pointer"
+                  >
+                    Chọn thư mục ngay
+                  </label>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handlePickLocalFolder(true)}
+                    className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0E] font-semibold text-xs cursor-pointer"
+                  >
+                    Chọn thư mục trên máy ngay
+                  </button>
+                )}
+                <label
+                  htmlFor={multiFileFolderInputId}
+                  onClick={() => {
+                    autoStartAfterPickRef.current = true;
+                  }}
+                  title="Mở thư mục rồi nhấn Ctrl+A để chọn tất cả file MP3 (hoạt động 100% ở mọi trình duyệt)"
+                  className="px-2.5 py-1 rounded bg-white/[0.1] hover:bg-white/[0.18] text-amber-100 font-medium text-xs cursor-pointer"
+                >
+                  Chọn file (Ctrl+A)
+                </label>
+                {isInsideIframe && typeof window !== 'undefined' && (
+                  <a
+                    href={window.location.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="Mở SpotFlow ở tab mới ngoài khung xem trước để chọn thư mục trực tiếp"
+                    className="px-2.5 py-1 rounded bg-[#1DB954]/20 border border-[#1DB954]/40 hover:bg-[#1DB954]/30 text-[#6ee79c] font-medium text-xs inline-flex items-center gap-1"
+                  >
+                    <span>Mở tab riêng</span>
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -1847,7 +2245,7 @@ export function LocalEnrichView({
           onDrop={(e) => {
             e.preventDefault();
             setIsDragging(false);
-            handleFilesSelected(e.dataTransfer.files);
+            void handleDropDataTransfer(e.dataTransfer, false);
           }}
           onClick={() => fileInputRef.current?.click()}
           className={`rounded-lg border border-dashed p-4 sm:p-5 text-center cursor-pointer transition-colors ${

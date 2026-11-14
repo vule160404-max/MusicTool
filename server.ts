@@ -11,10 +11,13 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   DeleteObjectCommand,
+  GetBucketCorsCommand,
   HeadBucketCommand,
+  PutBucketCorsCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 interface ArchiverInstance {
   on(event: 'error', listener: (err: Error) => void): this;
@@ -1297,13 +1300,68 @@ function detectImageType(buf: Buffer): { ext: string; contentType: string } {
   return { ext: 'jpg', contentType: 'image/jpeg' };
 }
 
+let lastCorsBucketKey = '';
+let lastCorsCheckedAt = 0;
+let lastCorsOk = false;
+
+async function ensureR2BucketCors(cfg: R2Settings): Promise<boolean> {
+  const key = `${cfg.accountId}:${cfg.bucketName}`;
+  if (lastCorsBucketKey === key && Date.now() - lastCorsCheckedAt < 15 * 60 * 1000) {
+    return lastCorsOk;
+  }
+  const client = getR2Client(cfg);
+  try {
+    const existing = await client
+      .send(new GetBucketCorsCommand({ Bucket: cfg.bucketName }))
+      .catch(() => null);
+    const hasPut = existing?.CORSRules?.some(
+      (r) =>
+        (r.AllowedOrigins || []).includes('*') &&
+        (r.AllowedMethods || []).includes('PUT')
+    );
+    if (hasPut) {
+      lastCorsBucketKey = key;
+      lastCorsCheckedAt = Date.now();
+      lastCorsOk = true;
+      return true;
+    }
+
+    await client.send(
+      new PutBucketCorsCommand({
+        Bucket: cfg.bucketName,
+        CORSConfiguration: {
+          CORSRules: [
+            {
+              AllowedOrigins: ['*'],
+              AllowedMethods: ['GET', 'PUT', 'HEAD'],
+              AllowedHeaders: ['*'],
+              ExposeHeaders: ['ETag'],
+              MaxAgeSeconds: 86400,
+            },
+          ],
+        },
+      })
+    );
+    lastCorsBucketKey = key;
+    lastCorsCheckedAt = Date.now();
+    lastCorsOk = true;
+    return true;
+  } catch {
+    lastCorsBucketKey = key;
+    lastCorsCheckedAt = Date.now();
+    lastCorsOk = false;
+    return false;
+  }
+}
+
 async function uploadJobToR2(job: DownloadJob): Promise<void> {
   const r2 = integrationSettings.r2;
   const errMsg = validateR2Config(r2);
   if (errMsg) {
     throw new Error(errMsg);
   }
-  if (!job.filePath || !fs.existsSync(job.filePath)) {
+  const hasAudioAlready = Boolean(job.r2AudioUrl && job.r2AudioKey);
+  if (!hasAudioAlready && (!job.filePath || !fs.existsSync(job.filePath))) {
     throw new Error('Không tìm thấy file MP3 tạm trên server để tải lên R2.');
   }
 
@@ -1370,12 +1428,14 @@ async function pushJobToWebhook(
 
   job.webhookStatus = 'pushing';
   job.webhookMessage = integrationSettings.r2.enabled
-    ? 'Đang tải MP3 & ảnh bìa lên Cloudflare R2...'
+    ? job.r2AudioUrl
+      ? 'Đang đồng bộ R2 sang App...'
+      : 'Đang tải MP3 & ảnh bìa lên Cloudflare R2...'
     : 'Đang đẩy bài hát sang App...';
   job.updatedAt = Date.now();
 
   try {
-    if (integrationSettings.r2.enabled) {
+    if (integrationSettings.r2.enabled && !(job.r2AudioUrl && (!job.coverUrl || job.r2CoverUrl))) {
       await uploadJobToR2(job);
       job.webhookMessage = 'Đã lên R2, đang đồng bộ về App Nhạc...';
       job.updatedAt = Date.now();
@@ -1688,6 +1748,7 @@ async function startServer() {
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({
       ok: true,
+      platform: process.platform,
       ffmpeg: HAS_FFMPEG,
       r2Configured: validateR2Config(integrationSettings.r2) === null,
       r2Enabled: integrationSettings.r2.enabled,
@@ -1865,6 +1926,542 @@ async function startServer() {
         message: `Lỗi kết nối R2: ${msg}`,
       });
     }
+  });
+
+  app.get('/api/cover-proxy', async (req: Request, res: Response) => {
+    const rawUrl = String(req.query.url || '').trim();
+    if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+      res.status(400).json({ error: 'Invalid cover URL' });
+      return;
+    }
+    try {
+      const buf = await downloadFileBuffer(rawUrl);
+      if (!buf || buf.length < 300) {
+        res.status(404).end();
+        return;
+      }
+      const { contentType } = detectImageType(buf);
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.send(buf);
+    } catch {
+      res.status(502).end();
+    }
+  });
+
+  app.post('/api/r2/presign', async (req: Request, res: Response) => {
+    const r2 = integrationSettings.r2;
+    if (!r2.enabled) {
+      res.status(400).json({ error: 'Cloudflare R2 chưa được bật.' });
+      return;
+    }
+    const errMsg = validateR2Config(r2);
+    if (errMsg) {
+      res.status(400).json({ error: errMsg });
+      return;
+    }
+
+    try {
+      const body = (req.body || {}) as {
+        title?: string;
+        artist?: string;
+        coverExt?: string;
+        coverContentType?: string;
+        needCoverUpload?: boolean;
+      };
+
+      const title = (body.title || 'Unknown Track').trim();
+      const artist = (body.artist || '').trim();
+      const jobId = crypto.randomUUID().slice(0, 12);
+      const shortId = jobId.slice(0, 8);
+      const slug = slugifyR2Segment(`${artist ? `${artist}-` : ''}${title}`);
+      const audioKey = `tracks/${slug}-${shortId}.mp3`;
+
+      const client = getR2Client(r2);
+      const publicBase = normalizePublicBaseUrl(r2.publicBaseUrl);
+      const corsOk = await ensureR2BucketCors(r2);
+
+      const audioUploadUrl = await getSignedUrl(
+        client,
+        new PutObjectCommand({
+          Bucket: r2.bucketName,
+          Key: audioKey,
+          ContentType: 'audio/mpeg',
+          CacheControl: 'public, max-age=31536000, immutable',
+        }),
+        { expiresIn: 900 }
+      );
+
+      let coverKey: string | null = null;
+      let coverUploadUrl: string | null = null;
+      let coverPublicUrl: string | null = null;
+
+      if (body.needCoverUpload) {
+        const ext = body.coverExt === 'png' ? 'png' : body.coverExt === 'webp' ? 'webp' : 'jpg';
+        const ctype =
+          body.coverContentType ||
+          (ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg');
+        coverKey = `covers/${slug}-${shortId}.${ext}`;
+        coverUploadUrl = await getSignedUrl(
+          client,
+          new PutObjectCommand({
+            Bucket: r2.bucketName,
+            Key: coverKey,
+            ContentType: ctype,
+            CacheControl: 'public, max-age=31536000, immutable',
+          }),
+          { expiresIn: 900 }
+        );
+        coverPublicUrl = `${publicBase}/${coverKey}`;
+      }
+
+      res.json({
+        jobId,
+        corsOk,
+        audioKey,
+        audioUploadUrl,
+        audioPublicUrl: `${publicBase}/${audioKey}`,
+        coverKey,
+        coverUploadUrl,
+        coverPublicUrl,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Không thể ký URL tải thẳng lên R2.',
+      });
+    }
+  });
+
+  app.post('/api/r2/complete-direct', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {
+        jobId?: string;
+        title?: string;
+        artist?: string;
+        album?: string;
+        fileName?: string;
+        sourceFileName?: string;
+        fileSizeBytes?: number;
+        durationMs?: number;
+        coverUrl?: string | null;
+        r2AudioKey?: string;
+        r2AudioUrl?: string;
+        r2CoverKey?: string | null;
+        r2CoverUrl?: string | null;
+        syncedLyrics?: string | null;
+        plainLyrics?: string | null;
+        autoPush?: boolean;
+        webhookUrl?: string;
+      };
+
+      const jobId = (body.jobId || '').trim() || crypto.randomUUID().slice(0, 12);
+      const r2AudioUrl = (body.r2AudioUrl || '').trim();
+      const r2AudioKey = (body.r2AudioKey || '').trim();
+      if (!r2AudioUrl || !r2AudioKey) {
+        res.status(400).json({ error: 'Thiếu thông tin r2AudioUrl / r2AudioKey.' });
+        return;
+      }
+
+      const title = (body.title || 'Unknown Track').trim();
+      const artist = (body.artist || '').trim();
+      const album = (body.album || '').trim();
+      const safeName = sanitizeFileName(`${artist ? `${artist} - ` : ''}${title}.mp3`);
+
+      const job: DownloadJob = {
+        jobId,
+        trackId: `local_${jobId}`,
+        title,
+        artist,
+        album,
+        bitrate: 320,
+        coverUrl: body.r2CoverUrl || body.coverUrl || null,
+        durationMs: Math.max(0, Number(body.durationMs) || 0),
+        syncedLyrics: body.syncedLyrics ?? null,
+        plainLyrics: body.plainLyrics ?? null,
+        sourceFileName: body.sourceFileName || body.fileName || safeName,
+        state: 'done',
+        progress: 100,
+        message: 'Đã gắn thẻ & đẩy thẳng lên R2!',
+        filePath: null,
+        fileName: safeName,
+        fileSizeBytes: Math.max(0, Number(body.fileSizeBytes) || 0),
+        error: null,
+        r2AudioUrl,
+        r2AudioKey,
+        r2CoverUrl: body.r2CoverUrl || null,
+        r2CoverKey: body.r2CoverKey || null,
+        storageProvider: 'r2',
+        webhookStatus: 'idle',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+
+      jobs.set(jobId, job);
+
+      if (body.autoPush) {
+        const host = req.get('host') || 'localhost:3000';
+        const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+        await pushJobToWebhook(job, host, proto, body.webhookUrl);
+      } else {
+        await upsertUploadHistoryItem({
+          title: job.title,
+          artist: job.artist,
+          album: job.album,
+          fileName: job.sourceFileName || job.fileName || safeName,
+          fileSizeBytes: job.fileSizeBytes,
+          pushedToApp: false,
+        });
+      }
+
+      res.json({ job: { ...job, filePath: null } });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Lỗi ghi nhận bài hát từ R2 Direct.',
+      });
+    }
+  });
+
+  app.get('/api/local/windows-sync-bundle', (req: Request, res: Response) => {
+    const rawFolder = String(req.query.folderPath || 'C:\\Users\\vule1\\Music\\Spotify Downloader')
+      .trim()
+      .replace(/^["']+|["']+$/g, '');
+    const host = req.get('host') || 'localhost:3000';
+    const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+    const rawServerUrl = String(req.query.serverUrl || `${proto}://${host}`).trim().replace(/\/+$/, '');
+    const webhookUrl = String(req.query.webhookUrl || integrationSettings.webhookUrl || '').trim();
+
+    const safeBatString = (s: string) => s.replace(/["\r\n]/g, '').trim();
+
+    const nodeAgentCode = `import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+
+const SPOTFLOW_URL = (process.env.SPOTFLOW_URL || '').replace(/\\/+$/, '');
+const FOLDER_PATH = (process.env.FOLDER_PATH || '').replace(/^["']+|["']+$/g, '');
+const WEBHOOK_URL = (process.env.WEBHOOK_URL || '').trim();
+const BATCH_SIZE = 50;
+const CONCURRENCY = 5;
+
+if (!SPOTFLOW_URL || !FOLDER_PATH) {
+  console.error('[SpotFlow] Thieu SPOTFLOW_URL hoac FOLDER_PATH.');
+  process.exit(1);
+}
+
+function normalizeText(v) {
+  return String(v || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+function normalizeFileKey(name) {
+  return normalizeText(String(name || '').replace(/\\.[a-zA-Z0-9]{2,5}$/, ''));
+}
+function normalizeTrackKey(title, artist) {
+  const t = normalizeText(title);
+  const a = normalizeText(artist);
+  return t ? (a ? t + '__' + a : t) : '';
+}
+function guessMeta(fileName) {
+  const base = fileName.replace(/\\.[a-zA-Z0-9]{2,5}$/, '').replace(/\\s+/g, ' ').trim();
+  const m = base.match(/^(.+?)\\s+[-–—]\\s+(.+)$/);
+  return m ? { artist: m[1].trim(), title: m[2].trim() } : { artist: '', title: base };
+}
+
+function stripId3Tags(buf) {
+  let start = 0;
+  if (buf.length >= 10 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) {
+    const size = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+    const footer = (buf[5] & 0x10) ? 10 : 0;
+    start = Math.min(buf.length, 10 + size + footer);
+  }
+  let end = buf.length;
+  if (end - start >= 128 && buf[end - 128] === 0x54 && buf[end - 127] === 0x41 && buf[end - 126] === 0x47) {
+    end -= 128;
+  }
+  return buf.subarray(start, end);
+}
+
+function encodeUtf16LeWithBom(str) {
+  const strBuf = Buffer.from(str, 'utf16le');
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), strBuf]);
+}
+
+function makeTextFrame(id, text) {
+  if (!text) return null;
+  const payload = Buffer.concat([Buffer.from([0x01]), encodeUtf16LeWithBom(text)]);
+  const header = Buffer.alloc(10);
+  header.write(id, 0, 4, 'ascii');
+  header.writeUInt32BE(payload.length, 4);
+  return Buffer.concat([header, payload]);
+}
+
+function makeUsltFrame(lyrics) {
+  if (!lyrics) return null;
+  const payload = Buffer.concat([
+    Buffer.from([0x01]),
+    Buffer.from('eng', 'ascii'),
+    Buffer.from([0xff, 0xfe, 0x00, 0x00]),
+    encodeUtf16LeWithBom(lyrics),
+  ]);
+  const header = Buffer.alloc(10);
+  header.write('USLT', 0, 4, 'ascii');
+  header.writeUInt32BE(payload.length, 4);
+  return Buffer.concat([header, payload]);
+}
+
+function makeApicFrame(imgBuf, mime) {
+  if (!imgBuf || imgBuf.length < 300) return null;
+  const payload = Buffer.concat([
+    Buffer.from([0x00]),
+    Buffer.from(mime || 'image/jpeg', 'ascii'),
+    Buffer.from([0x00, 0x03, 0x00]),
+    imgBuf,
+  ]);
+  const header = Buffer.alloc(10);
+  header.write('APIC', 0, 4, 'ascii');
+  header.writeUInt32BE(payload.length, 4);
+  return Buffer.concat([header, payload]);
+}
+
+function writeId3v23(mp3Buf, meta, imgBuf, imgMime) {
+  const clean = stripId3Tags(mp3Buf);
+  const frames = [
+    makeTextFrame('TIT2', meta.title),
+    makeTextFrame('TPE1', meta.artist),
+    makeTextFrame('TALB', meta.album),
+    makeUsltFrame(meta.syncedLyrics || meta.plainLyrics || ''),
+    makeApicFrame(imgBuf, imgMime),
+  ].filter(Boolean);
+  const body = Buffer.concat(frames);
+  const s = body.length;
+  const tagHeader = Buffer.from([
+    0x49, 0x44, 0x33, 0x03, 0x00, 0x00,
+    (s >> 21) & 0x7f, (s >> 14) & 0x7f, (s >> 7) & 0x7f, s & 0x7f,
+  ]);
+  return Buffer.concat([tagHeader, body, clean]);
+}
+
+async function scanFolder(dir, depth = 0, outAudio = [], outLrc = new Map()) {
+  if (depth > 4) return { outAudio, outLrc };
+  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      await scanFolder(full, depth + 1, outAudio, outLrc);
+    } else if (e.isFile()) {
+      const stem = e.name.replace(/\\.[a-zA-Z0-9]{2,5}$/, '').toLowerCase().replace(/\\s+/g, ' ').trim();
+      if (/\\.mp3$/i.test(e.name)) {
+        const st = await fsp.stat(full).catch(() => null);
+        if (st && st.size > 0) outAudio.push({ filePath: full, fileName: e.name, size: st.size, stem });
+      } else if (/\\.(lrc|txt)$/i.test(e.name) && !outLrc.has(stem)) {
+        outLrc.set(stem, full);
+      }
+    }
+  }
+  return { outAudio, outLrc };
+}
+
+async function run() {
+  console.log('=======================================================');
+  console.log(' SpotFlow Windows Direct-to-R2 Auto Sync (50 bai/luot)');
+  console.log(' Thu muc : ' + FOLDER_PATH);
+  console.log(' Server  : ' + SPOTFLOW_URL);
+  console.log('=======================================================');
+
+  if (!fs.existsSync(FOLDER_PATH)) {
+    console.error('[Loi] Khong tim thay thu muc: ' + FOLDER_PATH);
+    process.exit(1);
+  }
+
+  let totalDone = 0;
+  let batchNo = 0;
+  const sessionSeen = new Set();
+
+  while (true) {
+    batchNo++;
+    const histRes = await fetch(SPOTFLOW_URL + '/api/history');
+    if (!histRes.ok) {
+      throw new Error('Khong the ket noi ' + SPOTFLOW_URL + '/api/history (HTTP ' + histRes.status + ')');
+    }
+    const histJson = await histRes.json();
+    const histItems = Array.isArray(histJson.items) ? histJson.items : [];
+    const histFileKeys = new Set(histItems.map((h) => h.fileKey).filter(Boolean));
+    const histTrackKeys = new Set(histItems.map((h) => h.trackKey).filter(Boolean));
+
+    const { outAudio, outLrc } = await scanFolder(FOLDER_PATH);
+    outAudio.sort((a, b) => a.fileName.localeCompare(b.fileName, 'vi'));
+
+    const pending = [];
+    let skipped = 0;
+    for (const item of outAudio) {
+      const fk = normalizeFileKey(item.fileName);
+      const guessed = guessMeta(item.fileName);
+      const tk = normalizeTrackKey(guessed.title, guessed.artist);
+      if (sessionSeen.has(fk) || (fk && histFileKeys.has(fk)) || (tk && histTrackKeys.has(tk))) {
+        skipped++;
+        continue;
+      }
+      pending.push(item);
+    }
+
+    console.log('\\n[Lo #' + batchNo + '] Tong MP3: ' + outAudio.length + ' | Da loc trung: ' + skipped + ' | Con lai: ' + pending.length);
+    if (pending.length === 0) {
+      console.log('[Hoan tat] Tat ca bai hat trong thu muc da duoc dong bo sach se! Tong da xu ly: ' + totalDone);
+      break;
+    }
+
+    const batch = pending.slice(0, BATCH_SIZE);
+    for (const b of batch) sessionSeen.add(normalizeFileKey(b.fileName));
+
+    let cursor = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, batch.length) }).map(async () => {
+        while (cursor < batch.length) {
+          const idx = cursor++;
+          const item = batch[idx];
+          try {
+            const guessed = guessMeta(item.fileName);
+            const enrichRes = await fetch(SPOTFLOW_URL + '/api/local/enrich', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ fileName: item.fileName, title: guessed.title, artist: guessed.artist }),
+            });
+            const enriched = enrichRes.ok ? await enrichRes.json() : {};
+            const title = enriched.title || guessed.title;
+            const artist = enriched.artist || guessed.artist;
+            const album = enriched.album || '';
+            const coverUrl = enriched.coverUrl || null;
+            let syncedLyrics = enriched.syncedLyrics || null;
+            let plainLyrics = enriched.plainLyrics || null;
+
+            const lrcPath = outLrc.get(item.stem);
+            if (lrcPath && !syncedLyrics) {
+              const lrcRaw = (await fsp.readFile(lrcPath, 'utf8')).trim();
+              if (lrcRaw.length > 10) {
+                if (/\\[\\d{1,2}:\\d{2}/.test(lrcRaw)) syncedLyrics = lrcRaw;
+                else if (!plainLyrics) plainLyrics = lrcRaw;
+              }
+            }
+
+            let coverBuf = null;
+            let coverMime = 'image/jpeg';
+            let coverExt = 'jpg';
+            if (coverUrl) {
+              const cRes = await fetch(coverUrl).catch(() => null);
+              if (cRes && cRes.ok) {
+                coverBuf = Buffer.from(await cRes.arrayBuffer());
+                if (coverBuf.length > 400 && coverBuf[0] === 0x89 && coverBuf[1] === 0x50) {
+                  coverMime = 'image/png';
+                  coverExt = 'png';
+                }
+              }
+            }
+
+            const rawMp3 = await fsp.readFile(item.filePath);
+            const taggedMp3 = writeId3v23(rawMp3, { title, artist, album, syncedLyrics, plainLyrics }, coverBuf, coverMime);
+
+            const preRes = await fetch(SPOTFLOW_URL + '/api/r2/presign', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                title,
+                artist,
+                needCoverUpload: Boolean(coverBuf && coverBuf.length > 400),
+                coverExt,
+                coverContentType: coverMime,
+              }),
+            });
+            if (!preRes.ok) {
+              const errTxt = await preRes.text();
+              throw new Error('Presign failed: ' + errTxt);
+            }
+            const pre = await preRes.json();
+
+            const putAudio = fetch(pre.audioUploadUrl, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'audio/mpeg' },
+              body: taggedMp3,
+            });
+            const putCover = pre.coverUploadUrl && coverBuf
+              ? fetch(pre.coverUploadUrl, { method: 'PUT', headers: { 'Content-Type': coverMime }, body: coverBuf })
+              : Promise.resolve({ ok: true });
+
+            const [aPut, cPut] = await Promise.all([putAudio, putCover]);
+            if (!aPut.ok) throw new Error('R2 PUT audio HTTP ' + aPut.status);
+            if (!cPut.ok) throw new Error('R2 PUT cover HTTP ' + cPut.status);
+
+            const compRes = await fetch(SPOTFLOW_URL + '/api/r2/complete-direct', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jobId: pre.jobId,
+                title,
+                artist,
+                album,
+                fileName: item.fileName,
+                sourceFileName: item.fileName,
+                fileSizeBytes: taggedMp3.length,
+                durationMs: enriched.durationMs || 0,
+                coverUrl,
+                r2AudioKey: pre.audioKey,
+                r2AudioUrl: pre.audioPublicUrl,
+                r2CoverKey: pre.coverKey,
+                r2CoverUrl: pre.coverPublicUrl,
+                syncedLyrics,
+                plainLyrics,
+                autoPush: Boolean(WEBHOOK_URL),
+                webhookUrl: WEBHOOK_URL,
+              }),
+            });
+            if (!compRes.ok) throw new Error('Complete HTTP ' + compRes.status);
+            totalDone++;
+            console.log('  [OK ' + totalDone + '] ' + (artist ? artist + ' - ' : '') + title + ' -> R2 & App');
+          } catch (e) {
+            console.error('  [LOI] ' + item.fileName + ': ' + (e && e.message ? e.message : e));
+          }
+        }
+      })
+    );
+
+    if (pending.length <= BATCH_SIZE) {
+      console.log('\\n[Hoan tat] Da quet va dong bo xong toan bo ' + totalDone + ' bai moi!');
+      break;
+    }
+    console.log('[Nghi 1s] Chuan bi quet lo 50 bai tiep theo...');
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+run().catch((err) => {
+  console.error('[SpotFlow Sync Error]', err);
+  process.exit(1);
+});
+`;
+
+    const batContent = [
+      '@echo off',
+      'chcp 65001 >nul',
+      'setlocal',
+      `set "SPOTFLOW_URL=${safeBatString(rawServerUrl)}"`,
+      `set "FOLDER_PATH=${safeBatString(rawFolder)}"`,
+      `set "WEBHOOK_URL=${safeBatString(webhookUrl)}"`,
+      'where node >nul 2>nul',
+      'if errorlevel 1 (',
+      '  echo [SpotFlow] May chua cai Node.js. Dang cai dat Node.js LTS...',
+      '  winget install -e --id OpenJS.NodeJS.LTS',
+      '  echo Hay mo lai file nay sau khi cai Node.js xong.',
+      '  pause',
+      '  exit /b 1',
+      ')',
+      'powershell -NoProfile -Command "$c = Get-Content -Raw -Encoding UTF8 \'%~f0\'; $m = \'::NODE_\' + \'SCRIPT_START::\'; $i = $c.LastIndexOf($m); [IO.File]::WriteAllText(\'%TEMP%\\\\spotflow-sync.mjs\', $c.Substring($i + $m.Length), [Text.UTF8Encoding]::new($false))"',
+      'node "%TEMP%\\spotflow-sync.mjs"',
+      'echo.',
+      'pause',
+      'exit /b %ERRORLEVEL%',
+      '::NODE_SCRIPT_START::',
+      nodeAgentCode,
+    ].join('\r\n');
+
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment; filename="SpotFlow-AutoSync.bat"');
+    res.send(Buffer.from(batContent, 'utf8'));
   });
 
   const requireApiKey = (req: Request, res: Response, next: () => void) => {
@@ -2535,7 +3132,15 @@ async function startServer() {
   app.get('/api/download/file/:jobId', (req: Request, res: Response) => {
     const jobId = String(req.params.jobId);
     const job = jobs.get(jobId);
-    if (!job || job.state !== 'done' || !job.filePath || !fs.existsSync(job.filePath)) {
+    if (!job || job.state !== 'done') {
+      res.status(404).json({ error: 'File MP3 chưa sẵn sàng hoặc đã hết hạn.' });
+      return;
+    }
+    if ((!job.filePath || !fs.existsSync(job.filePath)) && job.r2AudioUrl) {
+      res.redirect(302, job.r2AudioUrl);
+      return;
+    }
+    if (!job.filePath || !fs.existsSync(job.filePath)) {
       res.status(404).json({ error: 'File MP3 chưa sẵn sàng hoặc đã hết hạn.' });
       return;
     }
