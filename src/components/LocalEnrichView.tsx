@@ -189,6 +189,7 @@ export function LocalEnrichView({
   const dirHandleRef = useRef<BrowserDirHandle | null>(null);
   const webkitSnapshotFilesRef = useRef<File[] | null>(null);
   const stopFolderLoopRef = useRef<boolean>(false);
+  const autoStartAfterPickRef = useRef<boolean>(false);
   const historyItemsRef = useRef<UploadHistoryItem[]>(historyItems);
   historyItemsRef.current = historyItems;
 
@@ -975,26 +976,57 @@ export function LocalEnrichView({
     setFolderWarningMsg(null);
   };
 
-  const handlePickLocalFolder = async () => {
+  const syncFolderInputKeepingFullPath = (pickedName: string) => {
+    const existing = folderPathInput
+      .trim()
+      .replace(/^["']+|["']+$/g, '')
+      .replace(/[\\/]+$/, '');
+    const existingTail = existing.split(/[\\/]/).pop()?.toLowerCase() || '';
+    if (!existing || existingTail !== pickedName.toLowerCase()) {
+      updateFolderPathInput(pickedName);
+    } else {
+      setFolderWarningMsg(null);
+    }
+  };
+
+  const handlePickLocalFolder = async (autoStartAfterPick = false) => {
     setFolderWarningMsg(null);
+    autoStartAfterPickRef.current = autoStartAfterPick;
+
+    let inIframe = false;
+    try {
+      inIframe = window.self !== window.top;
+    } catch {
+      inIframe = true;
+    }
+
     const winWithPicker = window as unknown as {
       showDirectoryPicker?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<BrowserDirHandle>;
     };
 
-    if (typeof winWithPicker.showDirectoryPicker === 'function') {
+    // Inside cross-origin iframes (like preview mode), showDirectoryPicker fails asynchronously
+    // and consumes Chrome's transient user gesture. Trigger webkitdirectory synchronously instead.
+    if (!inIframe && typeof winWithPicker.showDirectoryPicker === 'function') {
       try {
         const handle = await winWithPicker.showDirectoryPicker({ mode: 'read' });
         dirHandleRef.current = handle;
         webkitSnapshotFilesRef.current = null;
         setPickedFolderName(handle.name);
-        updateFolderPathInput(handle.name);
-        showToast(`Đã gắn thư mục "${handle.name}". Bấm "Quét & Tải 50 bài/lượt" để tự động chạy.`);
+        syncFolderInputKeepingFullPath(handle.name);
+        if (autoStartAfterPickRef.current) {
+          autoStartAfterPickRef.current = false;
+          showToast(`Đã gắn thư mục "${handle.name}" — đang tự động quét 50 bài/lượt...`);
+          void handleStartAutoFolderLoop(true);
+        } else {
+          showToast(`Đã gắn thư mục "${handle.name}". Bấm "Quét & Tải 50 bài/lượt" để tự động chạy.`);
+        }
         return;
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') {
+          autoStartAfterPickRef.current = false;
           return;
         }
-        // SecurityError in cross-origin iframe -> fallback to webkitdirectory input
+        // Fallback to <input webkitdirectory>
       }
     }
 
@@ -1002,16 +1034,36 @@ export function LocalEnrichView({
   };
 
   const handleWebkitFolderSelected = (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) return;
+    if (!fileList || fileList.length === 0) {
+      autoStartAfterPickRef.current = false;
+      return;
+    }
     const files = Array.from(fileList);
-    dirHandleRef.current = null;
-    webkitSnapshotFilesRef.current = files;
     const rel = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '';
     const rootName = rel.split('/')[0] || `${files.length} file trong thư mục`;
+    const audioCount = files.filter((f) => /\.(mp3|m4a|wav|ogg|flac|mp4|webm|mkv)$/i.test(f.name)).length;
+
+    if (audioCount === 0) {
+      autoStartAfterPickRef.current = false;
+      const msg = `Thư mục "${rootName}" chưa có file âm thanh (.mp3, .m4a, .wav, .flac...) nào.`;
+      setFolderWarningMsg(msg);
+      showToast(msg);
+      return;
+    }
+
+    dirHandleRef.current = null;
+    webkitSnapshotFilesRef.current = files;
     setPickedFolderName(rootName);
-    updateFolderPathInput(rootName);
+    syncFolderInputKeepingFullPath(rootName);
     setFolderWarningMsg(null);
-    showToast(`Đã nạp thư mục "${rootName}" (${files.length} file). Bấm "Quét & Tải 50 bài/lượt" để chạy.`);
+
+    if (autoStartAfterPickRef.current) {
+      autoStartAfterPickRef.current = false;
+      showToast(`Đã nạp "${rootName}" (${audioCount} bài nhạc) — đang tự động quét 50 bài/lượt...`);
+      void handleStartAutoFolderLoop(true);
+    } else {
+      showToast(`Đã nạp thư mục "${rootName}" (${audioCount} file nhạc). Bấm "Quét & Tải 50 bài/lượt" để chạy.`);
+    }
   };
 
   const fetchFreshHistoryForScan = async (): Promise<UploadHistoryItem[]> => {
@@ -1052,7 +1104,7 @@ export function LocalEnrichView({
 
     if (dirHandleRef.current) {
       const walkHandle = async (dir: BrowserDirHandle, depth: number) => {
-        if (depth > 3) return;
+        if (depth > 4) return;
         for await (const item of dir.values()) {
           if (item.kind === 'directory') {
             await walkHandle(item, depth + 1);
@@ -1209,13 +1261,24 @@ export function LocalEnrichView({
     showToast('Đang dừng quy trình quét thư mục tự động...');
   };
 
-  const handleStartAutoFolderLoop = async () => {
+  const handleStartAutoFolderLoop = async (forceBrowserSource = false) => {
     if (isAutoFolderRunning || isProcessingAll) return;
 
-    const trimmedInput = folderPathInput.trim();
+    const trimmedInput = folderPathInput
+      .trim()
+      .replace(/^["']+|["']+$/g, '')
+      .replace(/[\\/]+$/, '');
+    const hasBrowserSource = Boolean(dirHandleRef.current || webkitSnapshotFilesRef.current);
+    const inputTail = trimmedInput.split(/[\\/]/).pop()?.toLowerCase() || '';
+    const pickedLower = (pickedFolderName || '').toLowerCase();
+    const isWindowsOrUncPath = /^[a-zA-Z]:[\\/]/.test(trimmedInput) || /^\\\\/.test(trimmedInput);
     const useBrowserSource = Boolean(
-      (dirHandleRef.current || webkitSnapshotFilesRef.current) &&
-        (!trimmedInput || trimmedInput === pickedFolderName)
+      hasBrowserSource &&
+        (forceBrowserSource ||
+          !trimmedInput ||
+          !pickedLower ||
+          inputTail === pickedLower ||
+          isWindowsOrUncPath)
     );
 
     if (!useBrowserSource && !trimmedInput) {
@@ -1254,11 +1317,17 @@ export function LocalEnrichView({
 
           const scan = await collectBrowserBatch(latestHistory, sessionVisitedKeys);
           if (scan.batchAudioFiles.length === 0) {
-            showToast(
-              batchNumber === 1
-                ? `Đã quét ${scan.totalAudioFiles} file — toàn bộ đều đã có trong lịch sử (đã lọc trùng).`
-                : `Hoàn tất tự động! Đã xử lý ${totalProcessed} bài mới (${totalPushed} bài đã đẩy App) và quét sạch thư mục.`
-            );
+            if (scan.totalAudioFiles === 0) {
+              const emptyMsg = `Không tìm thấy file âm thanh (.mp3, .m4a, .wav, .flac...) nào trong thư mục "${pickedFolderName || trimmedInput}".`;
+              setFolderWarningMsg(emptyMsg);
+              showToast(emptyMsg);
+            } else {
+              showToast(
+                batchNumber === 1
+                  ? `Đã quét ${scan.totalAudioFiles} file — toàn bộ ${scan.skippedCount} bài đều đã có trong lịch sử (đã lọc trùng).`
+                  : `Hoàn tất tự động! Đã xử lý ${totalProcessed} bài mới (${totalPushed} bài đã đẩy App) và quét sạch thư mục.`
+              );
+            }
             break;
           }
 
@@ -1459,11 +1528,17 @@ export function LocalEnrichView({
           const remainingCount = scanData.remainingCount || 0;
 
           if (batchFiles.length === 0) {
-            showToast(
-              batchNumber === 1
-                ? `Đã quét ${scanData.totalAudioFiles || 0} file — tất cả đều đã có trong lịch sử.`
-                : `Hoàn tất! Đã xử lý ${totalProcessed} bài mới (${totalPushed} bài đã đẩy App) và quét sạch thư mục.`
-            );
+            if ((scanData.totalAudioFiles || 0) === 0) {
+              const emptyMsg = `Không tìm thấy file âm thanh (.mp3, .m4a, .wav, .flac...) nào trong "${trimmedInput}".`;
+              setFolderWarningMsg(emptyMsg);
+              showToast(emptyMsg);
+            } else {
+              showToast(
+                batchNumber === 1
+                  ? `Đã quét ${scanData.totalAudioFiles || 0} file — tất cả đều đã có trong lịch sử.`
+                  : `Hoàn tất! Đã xử lý ${totalProcessed} bài mới (${totalPushed} bài đã đẩy App) và quét sạch thư mục.`
+              );
+            }
             break;
           }
 
@@ -1644,32 +1719,33 @@ export function LocalEnrichView({
               className="hidden"
             />
 
-            <div className="relative flex-1 min-w-[220px] flex items-center">
-              <FolderOpen className="h-4 w-4 text-[#1DB954] absolute left-3 pointer-events-none shrink-0" />
+            <div className="flex-1 min-w-[220px] flex items-center h-9 rounded-md bg-[#141920] border border-white/[0.1] focus-within:border-[#1DB954]/60 px-2.5 gap-2">
+              <FolderOpen className="h-4 w-4 text-[#1DB954] shrink-0" />
               <input
                 type="text"
                 value={folderPathInput}
                 disabled={isAutoFolderRunning}
                 onChange={(e) => updateFolderPathInput(e.target.value)}
-                placeholder="Nhập đường dẫn thư mục MP3 (vd: D:\Nhac\MP3) hoặc chọn thư mục..."
-                className="w-full h-9 rounded-md bg-[#141920] border border-white/[0.1] focus:border-[#1DB954]/60 focus:outline-none pl-9 pr-3 text-xs text-slate-100 placeholder:text-slate-500 font-mono disabled:opacity-60"
+                placeholder="Nhập đường dẫn thư mục MP3 (vd: C:\Users\...\Music) hoặc chọn thư mục..."
+                className="flex-1 min-w-0 bg-transparent text-xs text-slate-100 placeholder:text-slate-500 font-mono focus:outline-none disabled:opacity-60"
               />
               {pickedFolderName && !isAutoFolderRunning && (
                 <button
                   type="button"
                   onClick={handleClearPickedFolder}
-                  title={`Bỏ chọn thư mục "${pickedFolderName}"`}
-                  className="absolute right-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#1DB954]/15 border border-[#1DB954]/30 text-[11px] text-[#6ee79c] hover:bg-[#1DB954]/25 cursor-pointer"
+                  title={`Đã gắn thư mục trình duyệt "${pickedFolderName}" (bấm × để gỡ)`}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#1DB954]/15 border border-[#1DB954]/30 text-[11px] text-[#6ee79c] hover:bg-[#1DB954]/25 shrink-0 cursor-pointer"
                 >
-                  <span className="max-w-[110px] truncate">{pickedFolderName}</span>
-                  <X className="h-3 w-3" />
+                  <Check className="h-3 w-3 shrink-0" />
+                  <span className="max-w-[130px] truncate">{pickedFolderName}</span>
+                  <X className="h-3 w-3 shrink-0" />
                 </button>
               )}
             </div>
 
             <button
               type="button"
-              onClick={handlePickLocalFolder}
+              onClick={() => void handlePickLocalFolder(false)}
               disabled={isAutoFolderRunning}
               title="Cấp quyền trình duyệt đọc thư mục MP3 trên máy (hỗ trợ cả khi server chạy trên Render)"
               className="h-9 px-3 rounded-md border border-white/[0.12] bg-white/[0.05] hover:bg-white/[0.1] disabled:opacity-45 text-xs font-medium text-slate-200 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
@@ -1712,7 +1788,7 @@ export function LocalEnrichView({
             ) : (
               <button
                 type="button"
-                onClick={handleStartAutoFolderLoop}
+                onClick={() => void handleStartAutoFolderLoop(false)}
                 disabled={isProcessingAll}
                 className="h-9 px-3.5 rounded-md bg-[#1DB954] hover:bg-[#1ED760] disabled:opacity-45 text-[#090B0E] text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
               >
@@ -1753,7 +1829,7 @@ export function LocalEnrichView({
               </span>
               <button
                 type="button"
-                onClick={handlePickLocalFolder}
+                onClick={() => void handlePickLocalFolder(true)}
                 className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0E] font-semibold text-xs shrink-0 cursor-pointer"
               >
                 Chọn thư mục trên máy ngay
