@@ -2098,10 +2098,11 @@ async function startServer() {
 
       jobs.set(jobId, job);
 
-      if (body.autoPush) {
+      const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
+      if (body.autoPush && effectiveWebhook) {
         const host = req.get('host') || 'localhost:3000';
         const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
-        await pushJobToWebhook(job, host, proto, body.webhookUrl);
+        await pushJobToWebhook(job, host, proto, effectiveWebhook);
       } else {
         await upsertUploadHistoryItem({
           title: job.title,
@@ -2162,6 +2163,89 @@ function guessMeta(fileName) {
   const base = fileName.replace(/\\.[a-zA-Z0-9]{2,5}$/, '').replace(/\\s+/g, ' ').trim();
   const m = base.match(/^(.+?)\\s+[-–—]\\s+(.+)$/);
   return m ? { artist: m[1].trim(), title: m[2].trim() } : { artist: '', title: base };
+}
+
+function decodeId3Text(buf) {
+  if (!buf || buf.length === 0) return '';
+  const enc = buf[0];
+  const body = buf.subarray(1);
+  if (enc === 0 || enc === 3) {
+    return body.toString('utf8').replace(/\\0+$/g, '').trim();
+  }
+  if (enc === 1 || enc === 2) {
+    let start = 0;
+    let isBe = enc === 2;
+    if (body.length >= 2 && body[0] === 0xff && body[1] === 0xfe) { start = 2; isBe = false; }
+    else if (body.length >= 2 && body[0] === 0xfe && body[1] === 0xff) { start = 2; isBe = true; }
+    let slice = body.subarray(start);
+    if (isBe) {
+      slice = Buffer.from(slice);
+      slice.swap16();
+    }
+    return slice.toString('utf16le').replace(/\\0+$/g, '').trim();
+  }
+  return body.toString('utf8').replace(/\\0+$/g, '').trim();
+}
+
+function extractId3v2Fallback(buf) {
+  const out = { title: '', artist: '', album: '', lyrics: '', coverBuf: null, coverMime: 'image/jpeg' };
+  if (!buf || buf.length < 10 || buf[0] !== 0x49 || buf[1] !== 0x44 || buf[2] !== 0x33) return out;
+  const ver = buf[3];
+  const tagSize = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+  const end = Math.min(buf.length, 10 + tagSize);
+  let pos = 10;
+  if (buf[5] & 0x40 && pos + 4 <= end) {
+    const extSize = ver === 4
+      ? (((buf[pos] & 0x7f) << 21) | ((buf[pos + 1] & 0x7f) << 14) | ((buf[pos + 2] & 0x7f) << 7) | (buf[pos + 3] & 0x7f))
+      : buf.readUInt32BE(pos);
+    pos += (ver === 4 ? extSize : extSize + 4);
+  }
+  while (pos + 10 <= end) {
+    const id = buf.subarray(pos, pos + 4).toString('ascii');
+    if (!/^[A-Z0-9]{4}$/.test(id)) break;
+    const fsize = ver === 4
+      ? (((buf[pos + 4] & 0x7f) << 21) | ((buf[pos + 5] & 0x7f) << 14) | ((buf[pos + 6] & 0x7f) << 7) | (buf[pos + 7] & 0x7f))
+      : buf.readUInt32BE(pos + 4);
+    pos += 10;
+    if (fsize <= 0 || pos + fsize > end) break;
+    const data = buf.subarray(pos, pos + fsize);
+    pos += fsize;
+    if (id === 'TIT2' && !out.title) out.title = decodeId3Text(data);
+    else if (id === 'TPE1' && !out.artist) out.artist = decodeId3Text(data);
+    else if (id === 'TALB' && !out.album) out.album = decodeId3Text(data);
+    else if (id === 'USLT' && !out.lyrics && data.length > 5) {
+      const enc = data[0];
+      let i = 4;
+      if (enc === 1 || enc === 2) {
+        while (i + 1 < data.length && !(data[i] === 0 && data[i + 1] === 0)) i += 2;
+        i += 2;
+      } else {
+        while (i < data.length && data[i] !== 0) i++;
+        i += 1;
+      }
+      if (i < data.length) {
+        out.lyrics = decodeId3Text(Buffer.concat([Buffer.from([enc]), data.subarray(i)]));
+      }
+    } else if (id === 'APIC' && !out.coverBuf && data.length > 8) {
+      const enc = data[0];
+      let mEnd = 1;
+      while (mEnd < data.length && data[mEnd] !== 0) mEnd++;
+      const mime = data.subarray(1, mEnd).toString('ascii').toLowerCase() || 'image/jpeg';
+      let dPos = mEnd + 2; // skip null + pic type
+      if (enc === 1 || enc === 2) {
+        while (dPos + 1 < data.length && !(data[dPos] === 0 && data[dPos + 1] === 0)) dPos += 2;
+        dPos += 2;
+      } else {
+        while (dPos < data.length && data[dPos] !== 0) dPos++;
+        dPos += 1;
+      }
+      if (dPos < data.length && data.length - dPos > 300) {
+        out.coverBuf = Buffer.from(data.subarray(dPos));
+        out.coverMime = mime.includes('png') ? 'image/png' : mime.includes('webp') ? 'image/webp' : 'image/jpeg';
+      }
+    }
+  }
+  return out;
 }
 
 function stripId3Tags(buf) {
@@ -2317,16 +2401,29 @@ async function run() {
           const idx = cursor++;
           const item = batch[idx];
           try {
+            const rawMp3 = await fsp.readFile(item.filePath);
+            const embedded = extractId3v2Fallback(rawMp3);
             const guessed = guessMeta(item.fileName);
-            const enrichRes = await fetch(SPOTFLOW_URL + '/api/local/enrich', {
+            const hintTitle = embedded.title || guessed.title;
+            const hintArtist = embedded.artist || guessed.artist;
+
+            const enrichRes = await fetch(SPOTFLOW_URL + '/api/metadata/enrich', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ fileName: item.fileName, title: guessed.title, artist: guessed.artist }),
+              body: JSON.stringify({
+                fileName: item.fileName,
+                title: hintTitle,
+                artist: hintArtist,
+                album: embedded.album || undefined,
+              }),
             });
+            if (!enrichRes.ok) {
+              console.warn('  [Canh bao] Enrich HTTP ' + enrichRes.status + ' cho ' + item.fileName);
+            }
             const enriched = enrichRes.ok ? await enrichRes.json() : {};
-            const title = enriched.title || guessed.title;
-            const artist = enriched.artist || guessed.artist;
-            const album = enriched.album || '';
+            const title = enriched.title || hintTitle;
+            const artist = enriched.artist || hintArtist;
+            const album = enriched.album || embedded.album || '';
             const coverUrl = enriched.coverUrl || null;
             let syncedLyrics = enriched.syncedLyrics || null;
             let plainLyrics = enriched.plainLyrics || null;
@@ -2335,9 +2432,19 @@ async function run() {
             if (lrcPath && !syncedLyrics) {
               const lrcRaw = (await fsp.readFile(lrcPath, 'utf8')).trim();
               if (lrcRaw.length > 10) {
-                if (/\\[\\d{1,2}:\\d{2}/.test(lrcRaw)) syncedLyrics = lrcRaw;
-                else if (!plainLyrics) plainLyrics = lrcRaw;
+                if (/\\[\\d{1,2}:\\d{2}/.test(lrcRaw)) {
+                  syncedLyrics = lrcRaw;
+                  if (!plainLyrics) {
+                    plainLyrics = lrcRaw.split(/\\r?\\n/).map((l) => l.replace(/\\[\\d{1,2}:\\d{2}(?:[.:]\\d{1,3})?\\]/g, '').trim()).filter(Boolean).join('\\n');
+                  }
+                } else if (!plainLyrics) {
+                  plainLyrics = lrcRaw;
+                }
               }
+            }
+            if (!syncedLyrics && !plainLyrics && embedded.lyrics) {
+              if (/\\[\\d{1,2}:\\d{2}/.test(embedded.lyrics)) syncedLyrics = embedded.lyrics;
+              else plainLyrics = embedded.lyrics;
             }
 
             let coverBuf = null;
@@ -2353,8 +2460,12 @@ async function run() {
                 }
               }
             }
+            if ((!coverBuf || coverBuf.length <= 400) && embedded.coverBuf) {
+              coverBuf = embedded.coverBuf;
+              coverMime = embedded.coverMime;
+              coverExt = coverMime.includes('png') ? 'png' : coverMime.includes('webp') ? 'webp' : 'jpg';
+            }
 
-            const rawMp3 = await fsp.readFile(item.filePath);
             const taggedMp3 = writeId3v23(rawMp3, { title, artist, album, syncedLyrics, plainLyrics }, coverBuf, coverMime);
 
             const preRes = await fetch(SPOTFLOW_URL + '/api/r2/presign', {
@@ -2406,13 +2517,20 @@ async function run() {
                 r2CoverUrl: pre.coverPublicUrl,
                 syncedLyrics,
                 plainLyrics,
-                autoPush: Boolean(WEBHOOK_URL),
+                autoPush: true,
                 webhookUrl: WEBHOOK_URL,
               }),
             });
             if (!compRes.ok) throw new Error('Complete HTTP ' + compRes.status);
+            const compData = await compRes.json().catch(() => ({}));
+            const pushedOk = compData && compData.job && compData.job.webhookStatus === 'pushed';
+            const coverTag = coverBuf && coverBuf.length > 400 ? 'Co' : 'Khong';
+            const lyrTag = syncedLyrics ? 'Synced' : (plainLyrics ? 'Thuong' : 'Khong');
             totalDone++;
-            console.log('  [OK ' + totalDone + '] ' + (artist ? artist + ' - ' : '') + title + ' -> R2 & App');
+            console.log(
+              '  [OK ' + totalDone + '] ' + (artist ? artist + ' - ' : '') + title +
+              ' | Anh bia: ' + coverTag + ' | Lyrics: ' + lyrTag + ' | App: ' + (pushedOk ? 'Da day' : 'Chi len R2')
+            );
           } catch (e) {
             console.error('  [LOI] ' + item.fileName + ': ' + (e && e.message ? e.message : e));
           }
@@ -2509,7 +2627,7 @@ run().catch((err) => {
     });
   });
 
-  app.post('/api/metadata/enrich', async (req: Request, res: Response) => {
+  const handleMetadataEnrich = async (req: Request, res: Response) => {
     try {
       const body = req.body as {
         fileName?: string;
@@ -2525,7 +2643,10 @@ run().catch((err) => {
         error: err instanceof Error ? err.message : 'Lỗi tìm ảnh bìa và lyrics.',
       });
     }
-  });
+  };
+
+  app.post('/api/metadata/enrich', handleMetadataEnrich);
+  app.post('/api/local/enrich', handleMetadataEnrich);
 
   app.post('/api/lyrics/search', async (req: Request, res: Response) => {
     try {
