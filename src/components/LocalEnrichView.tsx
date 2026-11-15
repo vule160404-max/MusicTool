@@ -30,7 +30,7 @@ import type {
   LocalTrackEntry,
   UploadHistoryItem,
 } from '../types';
-import { apiFetch, getBackendBaseUrl } from '../utils/api';
+import { apiFetch, getBackendBaseUrl, readJsonResponse } from '../utils/api';
 import {
   DirectR2UnavailableError,
   isDirectR2Mp3Candidate,
@@ -2013,7 +2013,7 @@ export function LocalEnrichView({
           includeR2: true,
         }),
       });
-      const data = (await res.json()) as CloudScanSummary & { error?: string };
+      const data = await readJsonResponse<CloudScanSummary & { error?: string }>(res);
       if (!res.ok) {
         throw new Error(data.error || `Lỗi quét Cloud (${res.status}).`);
       }
@@ -2089,13 +2089,13 @@ export function LocalEnrichView({
                   webhookUrl: webhookUrl.trim(),
                 }),
               });
-              const data = (await res.json()) as {
+              const data = await readJsonResponse<{
                 status?: 'updated' | 'no_source' | 'webhook_error';
                 message?: string;
                 lyricsType?: string;
                 hasNewCover?: boolean;
                 error?: string;
-              };
+              }>(res);
               if (!res.ok) {
                 errors++;
                 pushLog(`[Lỗi] ${label}: ${data.error || `HTTP ${res.status}`}`);

@@ -2260,6 +2260,33 @@ function getAppBaseUrl(webhook) {
   return 'https://soundly-psi.vercel.app';
 }
 
+async function fetchAppTracksSafe(primaryOrigin) {
+  const candidates = Array.from(new Set([primaryOrigin, 'https://soundly-psi.vercel.app'].filter(Boolean)));
+  let lastErr = 'Khong doc duoc /api/tracks';
+  for (const origin of candidates) {
+    try {
+      const r = await fetchWithRetry(origin + '/api/tracks', {}, { timeoutMs: 45000, retries: 2 });
+      const rawText = await r.text();
+      const trimmed = rawText.trim();
+      if (!r.ok) {
+        lastErr = origin + ' HTTP ' + r.status;
+        continue;
+      }
+      if (!trimmed || trimmed.startsWith('<')) {
+        lastErr = origin + ' tra ve HTML thay vi JSON';
+        continue;
+      }
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && Array.isArray(parsed.tracks)) return parsed.tracks;
+      lastErr = origin + ' tra ve JSON khong hop le';
+    } catch (e) {
+      lastErr = e && e.message ? e.message : String(e);
+    }
+  }
+  throw new Error('Khong the doc danh sach bai tu App: ' + lastErr);
+}
+
 function stripDiacritics(v) {
   return String(v || '')
     .normalize('NFD')
@@ -2790,12 +2817,8 @@ async function runRepairBackfill() {
     }
 
     console.log('\\n[1/3] Dang tai danh sach bai thieu Anh bia / Lyrics tu ' + appBaseUrl + '/api/tracks ...');
-    const appRes = await fetchWithRetry(appBaseUrl + '/api/tracks', {}, { timeoutMs: 45000, retries: 2 });
-    if (!appRes.ok) {
-      throw new Error('Khong the doc danh sach bai tu App (HTTP ' + appRes.status + ')');
-    }
-    const appTracks = await appRes.json();
-    const needRepairList = (Array.isArray(appTracks) ? appTracks : []).filter(trackNeedsRepair);
+    const appTracks = await fetchAppTracksSafe(appBaseUrl);
+    const needRepairList = appTracks.filter(trackNeedsRepair);
 
     const byTrackKey = new Map();
     const byRevTrackKey = new Map();
@@ -2931,12 +2954,8 @@ async function runCloudRepairNoLocal() {
   let totalErrors = 0;
 
   console.log('\\n[1/2] Dang tai danh sach bai thieu Anh bia / Lyrics tu ' + appBaseUrl + '/api/tracks ...');
-  const appRes = await fetchWithRetry(appBaseUrl + '/api/tracks', {}, { timeoutMs: 45000, retries: 2 });
-  if (!appRes.ok) {
-    throw new Error('Khong the doc danh sach bai tu App (HTTP ' + appRes.status + ')');
-  }
-  const appTracks = await appRes.json();
-  const rawTargets = (Array.isArray(appTracks) ? appTracks : []).filter(trackNeedsRepair);
+  const appTracks = await fetchAppTracksSafe(appBaseUrl);
+  const rawTargets = appTracks.filter(trackNeedsRepair);
   const targets = [];
   for (const t of rawTargets) {
     if (!t.r2AudioKey || sessionProcessedR2Keys.has(t.r2AudioKey)) continue;
@@ -3346,28 +3365,65 @@ run().catch((err) => {
         includeR2?: boolean;
       };
       const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
-      let appOrigin = 'https://soundly-psi.vercel.app';
+      const defaultAppOrigin = 'https://soundly-psi.vercel.app';
+      let preferredOrigin = defaultAppOrigin;
       const urlCandidate = (body.appUrl || effectiveWebhook || '').trim();
       if (urlCandidate) {
         try {
-          appOrigin = new URL(urlCandidate).origin;
+          preferredOrigin = new URL(urlCandidate).origin;
         } catch {
           // Fallback to soundly origin
         }
       }
 
-      const appRes = await fetch(`${appOrigin}/api/tracks`, {
-        signal: AbortSignal.timeout(40000),
-      });
-      if (!appRes.ok) {
-        res.status(502).json({ error: `Không thể đọc danh sách bài hát từ App (${appRes.status}).` });
-        return;
+      const candidateOrigins = Array.from(new Set([preferredOrigin, defaultAppOrigin]));
+      let appOrigin = preferredOrigin;
+      let appTracks: SoundlyAppTrackItem[] = [];
+      let appLoaded = false;
+      let lastAppError = '';
+
+      for (const origin of candidateOrigins) {
+        try {
+          const appRes = await fetch(`${origin}/api/tracks`, {
+            signal: AbortSignal.timeout(40000),
+          });
+          const rawText = await appRes.text();
+          const trimmed = rawText.trim();
+          if (!appRes.ok) {
+            lastAppError = `${origin}/api/tracks phản hồi HTTP ${appRes.status}`;
+            continue;
+          }
+          if (!trimmed || trimmed.startsWith('<')) {
+            lastAppError = `${origin}/api/tracks trả về trang HTML thay vì JSON`;
+            continue;
+          }
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (Array.isArray(parsed)) {
+            appTracks = parsed as SoundlyAppTrackItem[];
+            appOrigin = origin;
+            appLoaded = true;
+            break;
+          }
+          if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { tracks?: unknown }).tracks)) {
+            appTracks = (parsed as { tracks: SoundlyAppTrackItem[] }).tracks;
+            appOrigin = origin;
+            appLoaded = true;
+            break;
+          }
+          lastAppError = `${origin}/api/tracks trả về JSON không đúng định dạng mảng bài hát`;
+        } catch (err) {
+          lastAppError = err instanceof Error ? err.message : `Lỗi đọc ${origin}/api/tracks`;
+        }
       }
 
-      const appTracksRaw = (await appRes.json()) as unknown;
-      const appTracks: SoundlyAppTrackItem[] = Array.isArray(appTracksRaw)
-        ? (appTracksRaw as SoundlyAppTrackItem[])
-        : [];
+      const r2 = integrationSettings.r2;
+      const canScanR2 = body.includeR2 !== false && r2.enabled && validateR2Config(r2) === null;
+      if (!appLoaded && !canScanR2) {
+        res.status(502).json({
+          error: `Không thể đọc danh sách bài hát từ App (${lastAppError || 'Không phản hồi'}).`,
+        });
+        return;
+      }
 
       const isRealCover = (u?: string) => {
         const clean = String(u || '').trim();
@@ -3429,15 +3485,14 @@ run().catch((err) => {
 
       let r2TotalCount: number | null = null;
       let orphanR2Count = 0;
-      const r2 = integrationSettings.r2;
-      if (body.includeR2 !== false && r2.enabled && validateR2Config(r2) === null) {
+      if (canScanR2) {
         try {
           const client = getR2Client(r2);
           const publicBase = normalizePublicBaseUrl(r2.publicBaseUrl);
           let continuationToken: string | undefined;
           let pages = 0;
           let totalR2Mp3 = 0;
-          while (pages < 10) {
+          while (pages < 30) {
             pages++;
             const listOut = await client.send(
               new ListObjectsV2Command({

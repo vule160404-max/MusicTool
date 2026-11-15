@@ -63,13 +63,31 @@ export async function apiFetch(endpoint: string, init?: RequestInit): Promise<Re
   }
 }
 
+export async function readJsonResponse<T = Record<string, unknown>>(res: Response): Promise<T> {
+  const text = await res.text();
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return {} as T;
+  }
+  if (trimmed.startsWith('<')) {
+    throw new Error(
+      `Máy chủ trả về trang HTML thay vì JSON (HTTP ${res.status}). Nếu bạn dùng Render, hãy bấm Deploy lại Backend bản mới nhất rồi tải lại trang (Ctrl+F5).`
+    );
+  }
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    throw new Error(`Phản hồi không đúng định dạng JSON (HTTP ${res.status}): ${trimmed.slice(0, 120)}`);
+  }
+}
+
 export async function checkBackendStatus(): Promise<{ ok: boolean; ffmpeg?: boolean; error?: string }> {
   try {
     const res = await apiFetch('/api/health');
     if (!res.ok) {
       return { ok: false, error: `Máy chủ phản hồi mã lỗi ${res.status}` };
     }
-    const data = (await res.json()) as { ok?: boolean; ffmpeg?: boolean };
+    const data = await readJsonResponse<{ ok?: boolean; ffmpeg?: boolean }>(res);
     return { ok: Boolean(data.ok), ffmpeg: Boolean(data.ffmpeg) };
   } catch (err) {
     return {
