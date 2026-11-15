@@ -2189,12 +2189,56 @@ const SPOTFLOW_URL = (process.env.SPOTFLOW_URL || '').replace(/\\/+$/, '');
 let FOLDER_PATH = (process.env.FOLDER_PATH || '').replace(/^["']+|["']+$/g, '');
 let WEBHOOK_URL = (process.env.WEBHOOK_URL || '').trim();
 const DEFAULT_SYNC_MODE = (process.env.SYNC_MODE || 'menu').trim().toLowerCase();
-const BATCH_SIZE = 50;
-const CONCURRENCY = 5;
+const CONCURRENCY = Math.max(4, Math.min(20, Number(process.env.SYNC_CONCURRENCY) || 10));
 
 if (!SPOTFLOW_URL) {
   console.error('[SpotFlow] Thieu SPOTFLOW_URL.');
   process.exit(1);
+}
+
+async function fetchWithRetry(url, init = {}, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 25000;
+  const retries = typeof opts.retries === 'number' ? opts.retries : 2;
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+        await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+        continue;
+      }
+    }
+  }
+  throw lastErr || new Error('Request failed: ' + url);
+}
+
+async function runWorkerPool(items, concurrency, fn) {
+  if (!items || items.length === 0) return;
+  let cursor = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }).map(async () => {
+      while (cursor < items.length) {
+        const idx = cursor++;
+        await fn(items[idx], idx);
+      }
+    })
+  );
+}
+
+function formatRate(doneCount, startedAtMs) {
+  const sec = Math.max(0.5, (Date.now() - startedAtMs) / 1000);
+  return (doneCount / sec).toFixed(1) + ' bai/s';
 }
 
 function askPrompt(question) {
@@ -2500,7 +2544,7 @@ async function processTrackAndUpload(opts) {
   const hintArtist = embedded.artist || rawTargetArtist || guessed.artist;
   const hintAlbum = embedded.album || (overrideTarget && overrideTarget.album !== 'Kho nhạc Cloudflare R2' ? overrideTarget.album : '');
 
-  const enrichRes = await fetch(SPOTFLOW_URL + '/api/metadata/enrich', {
+  const enrichRes = await fetchWithRetry(SPOTFLOW_URL + '/api/metadata/enrich', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2509,7 +2553,7 @@ async function processTrackAndUpload(opts) {
       artist: hintArtist,
       album: hintAlbum || undefined,
     }),
-  });
+  }, { timeoutMs: 25000, retries: 2 });
   if (!enrichRes.ok) {
     console.warn('  [Canh bao] Enrich HTTP ' + enrichRes.status + ' cho ' + item.fileName);
   }
@@ -2543,7 +2587,7 @@ async function processTrackAndUpload(opts) {
   let coverImg = null;
   let coverFromExistingTarget = false;
   if (onlineCoverUrl) {
-    const cRes = await fetch(onlineCoverUrl).catch(() => null);
+    const cRes = await fetchWithRetry(onlineCoverUrl, {}, { timeoutMs: 12000, retries: 1 }).catch(() => null);
     if (cRes && cRes.ok) {
       coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
     }
@@ -2552,7 +2596,7 @@ async function processTrackAndUpload(opts) {
     coverImg = await detectImageFromBuffer(embedded.coverBuf, embedded.coverMime);
   }
   if (!coverImg && overrideTarget && isRealCoverUrl(overrideTarget.coverUrl)) {
-    const cRes = await fetch(overrideTarget.coverUrl).catch(() => null);
+    const cRes = await fetchWithRetry(overrideTarget.coverUrl, {}, { timeoutMs: 12000, retries: 1 }).catch(() => null);
     if (cRes && cRes.ok) {
       coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
       if (coverImg) coverFromExistingTarget = true;
@@ -2588,24 +2632,24 @@ async function processTrackAndUpload(opts) {
     preBody.isOverwrite = true;
   }
 
-  const preRes = await fetch(SPOTFLOW_URL + '/api/r2/presign', {
+  const preRes = await fetchWithRetry(SPOTFLOW_URL + '/api/r2/presign', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(preBody),
-  });
+  }, { timeoutMs: 20000, retries: 2 });
   if (!preRes.ok) {
     const errTxt = await preRes.text();
     throw new Error('Presign failed: ' + errTxt);
   }
   const pre = await preRes.json();
 
-  const putAudio = fetch(pre.audioUploadUrl, {
+  const putAudio = fetchWithRetry(pre.audioUploadUrl, {
     method: 'PUT',
     headers: { 'Content-Type': 'audio/mpeg' },
     body: taggedMp3,
-  });
+  }, { timeoutMs: 45000, retries: 2 });
   const putCover = pre.coverUploadUrl && coverImg
-    ? fetch(pre.coverUploadUrl, { method: 'PUT', headers: { 'Content-Type': coverImg.mime }, body: coverImg.buf })
+    ? fetchWithRetry(pre.coverUploadUrl, { method: 'PUT', headers: { 'Content-Type': coverImg.mime }, body: coverImg.buf }, { timeoutMs: 20000, retries: 2 })
     : Promise.resolve({ ok: true });
 
   const [aPut, cPut] = await Promise.all([putAudio, putCover]);
@@ -2615,7 +2659,7 @@ async function processTrackAndUpload(opts) {
   const existingRealCover = overrideTarget && isRealCoverUrl(overrideTarget.coverUrl) ? overrideTarget.coverUrl : null;
   const finalCoverUrl = pre.coverPublicUrl || existingRealCover || onlineCoverUrl || null;
 
-  const compRes = await fetch(SPOTFLOW_URL + '/api/r2/complete-direct', {
+  const compRes = await fetchWithRetry(SPOTFLOW_URL + '/api/r2/complete-direct', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2638,7 +2682,7 @@ async function processTrackAndUpload(opts) {
       autoPush: true,
       webhookUrl: WEBHOOK_URL,
     }),
-  });
+  }, { timeoutMs: 25000, retries: 2 });
   if (!compRes.ok) throw new Error('Complete HTTP ' + compRes.status);
   const compData = await compRes.json().catch(() => ({}));
   const pushedOk = compData && compData.job && compData.job.webhookStatus === 'pushed';
@@ -2658,77 +2702,78 @@ async function runNormalSync() {
     process.exit(1);
   }
 
-  let totalDone = 0;
-  let batchNo = 0;
-  const sessionSeen = new Set();
-
-  while (true) {
-    batchNo++;
-    const histRes = await fetch(SPOTFLOW_URL + '/api/history');
-    if (!histRes.ok) {
-      throw new Error('Khong the ket noi ' + SPOTFLOW_URL + '/api/history (HTTP ' + histRes.status + ')');
-    }
-    const histJson = await histRes.json();
-    const histItems = Array.isArray(histJson.items) ? histJson.items : [];
-    const histFileKeys = new Set(histItems.map((h) => h.fileKey).filter(Boolean));
-    const histTrackKeys = new Set(
-      histItems.map((h) => String(h.trackKey || '').replace(/::/g, '__')).filter(Boolean)
-    );
-
-    const { outAudio, outLrc } = await scanFolder(FOLDER_PATH);
-    outAudio.sort((a, b) => a.fileName.localeCompare(b.fileName, 'vi'));
-
-    const pending = [];
-    let skipped = 0;
-    for (const item of outAudio) {
-      const fk = normalizeFileKey(item.fileName);
-      const guessed = guessMeta(item.fileName);
-      const tk = normalizeTrackKey(guessed.title, guessed.artist);
-      if (sessionSeen.has(fk) || (fk && histFileKeys.has(fk)) || (tk && histTrackKeys.has(tk))) {
-        skipped++;
-        continue;
-      }
-      pending.push(item);
-    }
-
-    console.log('\\n[Lo #' + batchNo + '] Tong MP3: ' + outAudio.length + ' | Da loc trung: ' + skipped + ' | Con lai: ' + pending.length);
-    if (pending.length === 0) {
-      console.log('[Hoan tat] Tat ca bai hat trong thu muc da duoc dong bo sach se! Tong da xu ly: ' + totalDone);
-      break;
-    }
-
-    const batch = pending.slice(0, BATCH_SIZE);
-    for (const b of batch) sessionSeen.add(normalizeFileKey(b.fileName));
-
-    let cursor = 0;
-    await Promise.all(
-      Array.from({ length: Math.min(CONCURRENCY, batch.length) }).map(async () => {
-        while (cursor < batch.length) {
-          const idx = cursor++;
-          const item = batch[idx];
-          try {
-            const res = await processTrackAndUpload({ item, outLrc, overrideTarget: null });
-            totalDone++;
-            console.log(
-              '  [OK ' + totalDone + '] ' + (res.artist ? res.artist + ' - ' : '') + res.title +
-              ' | Anh bia: ' + (res.hasCover ? 'Co' : 'Khong') +
-              ' | Lyrics: ' + res.lyricsType +
-              ' | App: ' + (res.pushedOk ? 'Da day' : 'Chi len R2')
-            );
-          } catch (e) {
-            console.error('  [LOI] ' + item.fileName + ': ' + (e && e.message ? e.message : e));
-          }
-        }
-      })
-    );
-
-    if (pending.length <= BATCH_SIZE) {
-      console.log('\\n[Hoan tat] Da quet va dong bo xong toan bo ' + totalDone + ' bai moi!');
-      break;
-    }
-    console.log('[Nghi 1s] Chuan bi quet lo 50 bai tiep theo...');
-    await new Promise((r) => setTimeout(r, 1000));
+  console.log('\\n[1/2] Dang tai lich su trung tu SpotFlow...');
+  const histRes = await fetchWithRetry(SPOTFLOW_URL + '/api/history', {}, { timeoutMs: 25000, retries: 2 });
+  if (!histRes.ok) {
+    throw new Error('Khong the ket noi ' + SPOTFLOW_URL + '/api/history (HTTP ' + histRes.status + ')');
   }
+  const histJson = await histRes.json();
+  const histItems = Array.isArray(histJson.items) ? histJson.items : [];
+  const histFileKeys = new Set(histItems.map((h) => h.fileKey).filter(Boolean));
+  const histTrackKeys = new Set(
+    histItems.map((h) => String(h.trackKey || '').replace(/::/g, '__')).filter(Boolean)
+  );
+
+  console.log('[2/2] Dang quet toan bo thu muc: ' + FOLDER_PATH + ' ...');
+  const { outAudio, outLrc } = await scanFolder(FOLDER_PATH);
+  outAudio.sort((a, b) => a.fileName.localeCompare(b.fileName, 'vi'));
+
+  const pending = [];
+  let skipped = 0;
+  const sessionSeen = new Set();
+  for (const item of outAudio) {
+    const fk = normalizeFileKey(item.fileName);
+    const guessed = guessMeta(item.fileName);
+    const tk = normalizeTrackKey(guessed.title, guessed.artist);
+    if (sessionSeen.has(fk) || (fk && histFileKeys.has(fk)) || (tk && histTrackKeys.has(tk))) {
+      skipped++;
+      continue;
+    }
+    if (fk) sessionSeen.add(fk);
+    pending.push(item);
+  }
+
+  console.log('=======================================================');
+  console.log(' Tong MP3 trong thu muc  : ' + outAudio.length);
+  console.log(' Da loc trung lich su    : ' + skipped);
+  console.log(' Can tai len ngay        : ' + pending.length + ' bai');
+  console.log(' Toc do xu ly            : ' + CONCURRENCY + ' luong LIEN TUC (Het toc luc, khong chia lo)');
+  console.log('=======================================================');
+
+  if (pending.length === 0) {
+    console.log('[Hoan tat] Tat ca bai hat trong thu muc da duoc dong bo sach se!');
+    return;
+  }
+
+  const startedAt = Date.now();
+  let totalDone = 0;
+  let totalErrors = 0;
+  let processedCount = 0;
+
+  await runWorkerPool(pending, CONCURRENCY, async (item) => {
+    try {
+      const res = await processTrackAndUpload({ item, outLrc, overrideTarget: null });
+      totalDone++;
+      processedCount++;
+      const pct = Math.round((processedCount / pending.length) * 100);
+      console.log(
+        '  [OK ' + processedCount + '/' + pending.length + ' · ' + pct + '% · ' + formatRate(processedCount, startedAt) + '] ' +
+        (res.artist ? res.artist + ' - ' : '') + res.title +
+        ' | Anh: ' + (res.hasCover ? 'Co' : 'Khong') +
+        ' | Lyrics: ' + res.lyricsType +
+        ' | App: ' + (res.pushedOk ? 'OK' : 'R2')
+      );
+    } catch (e) {
+      totalErrors++;
+      processedCount++;
+      console.error('  [LOI ' + processedCount + '/' + pending.length + '] ' + item.fileName + ': ' + (e && e.message ? e.message : e));
+    }
+  });
+
+  const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+  console.log('\\n=======================================================');
+  console.log(' [HOAN TAT HET TOC LUC] Thanh cong: ' + totalDone + ' | Loi: ' + totalErrors + ' | Thoi gian: ' + elapsedSec + 's (' + formatRate(totalDone, startedAt) + ')');
+  console.log('=======================================================');
 }
 
 async function runRepairBackfill() {
@@ -2745,7 +2790,7 @@ async function runRepairBackfill() {
     }
 
     console.log('\\n[1/3] Dang tai danh sach bai thieu Anh bia / Lyrics tu ' + appBaseUrl + '/api/tracks ...');
-    const appRes = await fetch(appBaseUrl + '/api/tracks');
+    const appRes = await fetchWithRetry(appBaseUrl + '/api/tracks', {}, { timeoutMs: 45000, retries: 2 });
     if (!appRes.ok) {
       throw new Error('Khong the doc danh sach bai tu App (HTTP ' + appRes.status + ')');
     }
@@ -2781,28 +2826,21 @@ async function runRepairBackfill() {
     const queuedR2Keys = new Set();
 
     let scanDone = 0;
-    let scanCursor = 0;
     const quickMetaList = new Array(outAudio.length);
-    await Promise.all(
-      Array.from({ length: Math.min(16, Math.max(1, outAudio.length)) }).map(async () => {
-        while (scanCursor < outAudio.length) {
-          const i = scanCursor++;
-          const audio = outAudio[i];
-          const hdrMeta = await readQuickId3Header(audio.filePath);
-          const guessed = guessMeta(audio.fileName);
-          quickMetaList[i] = {
-            audio,
-            title: hdrMeta.title || guessed.title,
-            artist: hdrMeta.artist || guessed.artist,
-            fileSlug: slugifySeg(audio.fileName.replace(/\\.[a-zA-Z0-9]{2,5}$/, '')),
-          };
-          scanDone++;
-          if (scanDone % 400 === 0) {
-            console.log('  Da doc header ' + scanDone + '/' + outAudio.length + ' file...');
-          }
-        }
-      })
-    );
+    await runWorkerPool(outAudio, 16, async (audio, i) => {
+      const hdrMeta = await readQuickId3Header(audio.filePath);
+      const guessed = guessMeta(audio.fileName);
+      quickMetaList[i] = {
+        audio,
+        title: hdrMeta.title || guessed.title,
+        artist: hdrMeta.artist || guessed.artist,
+        fileSlug: slugifySeg(audio.fileName.replace(/\\.[a-zA-Z0-9]{2,5}$/, '')),
+      };
+      scanDone++;
+      if (scanDone % 400 === 0) {
+        console.log('  Da doc header ' + scanDone + '/' + outAudio.length + ' file...');
+      }
+    });
 
     for (const qm of quickMetaList) {
       if (!qm) continue;
@@ -2833,56 +2871,44 @@ async function runRepairBackfill() {
     console.log(' Tong bai dang thieu tren App/R2 : ' + needRepairList.length);
     console.log(' Tong MP3 trong thu muc nay     : ' + outAudio.length);
     console.log(' Khop de QUET BU dot nay        : ' + matchedPairs.length + ' bai');
+    console.log(' Toc do xu ly                   : ' + CONCURRENCY + ' luong LIEN TUC (Het toc luc)');
     console.log('=======================================================');
 
     if (matchedPairs.length === 0) {
       console.log('[Thong bao] Khong con bai nao khop can bu trong thu muc nay!');
     } else {
-      let batchNo = 0;
-      for (let start = 0; start < matchedPairs.length; start += BATCH_SIZE) {
-        batchNo++;
-        const batch = matchedPairs.slice(start, start + BATCH_SIZE);
-        const remainAfter = Math.max(0, matchedPairs.length - (start + batch.length));
-        console.log('\\n[Lo BU #' + batchNo + '] Dang xu ly ' + batch.length + ' bai (Con lai: ' + remainAfter + ')...');
+      const startedAt = Date.now();
+      let processedCount = 0;
 
-        let cursor = 0;
-        await Promise.all(
-          Array.from({ length: Math.min(CONCURRENCY, batch.length) }).map(async () => {
-            while (cursor < batch.length) {
-              const idx = cursor++;
-              const pair = batch[idx];
-              sessionProcessedR2Keys.add(pair.target.r2AudioKey);
-              try {
-                const res = await processTrackAndUpload({
-                  item: pair.item,
-                  outLrc,
-                  overrideTarget: pair.target,
-                });
-                if (res.skippedNoMeta) {
-                  totalNoMeta++;
-                  console.log('  [BO QUA] ' + pair.item.fileName + ' (Khong tim thay anh bia/lyrics moi)');
-                } else {
-                  totalRepaired++;
-                  console.log(
-                    '  [BU ' + totalRepaired + '] ' + (res.artist ? res.artist + ' - ' : '') + res.title +
-                    ' | Anh bia: ' + (res.hasCover ? 'Co' : 'Khong') +
-                    ' | Lyrics: ' + res.lyricsType +
-                    ' | R2: Ghi de OK | App: ' + (res.pushedOk ? 'Da cap nhat' : 'Chi len R2')
-                  );
-                }
-              } catch (e) {
-                totalErrors++;
-                console.error('  [LOI] ' + pair.item.fileName + ': ' + (e && e.message ? e.message : e));
-              }
-            }
-          })
-        );
-
-        if (remainAfter > 0) {
-          console.log('[Nghi 1s] Chuan bi lo QUET BU tiep theo...');
-          await new Promise((r) => setTimeout(r, 1000));
+      await runWorkerPool(matchedPairs, CONCURRENCY, async (pair) => {
+        sessionProcessedR2Keys.add(pair.target.r2AudioKey);
+        try {
+          const res = await processTrackAndUpload({
+            item: pair.item,
+            outLrc,
+            overrideTarget: pair.target,
+          });
+          processedCount++;
+          const pct = Math.round((processedCount / matchedPairs.length) * 100);
+          if (res.skippedNoMeta) {
+            totalNoMeta++;
+            console.log('  [BO QUA ' + processedCount + '/' + matchedPairs.length + '] ' + pair.item.fileName + ' (Chua co anh/lyrics moi)');
+          } else {
+            totalRepaired++;
+            console.log(
+              '  [BU ' + processedCount + '/' + matchedPairs.length + ' · ' + pct + '% · ' + formatRate(processedCount, startedAt) + '] ' +
+              (res.artist ? res.artist + ' - ' : '') + res.title +
+              ' | Anh: ' + (res.hasCover ? 'Co' : 'Khong') +
+              ' | Lyrics: ' + res.lyricsType +
+              ' | App: ' + (res.pushedOk ? 'OK' : 'R2')
+            );
+          }
+        } catch (e) {
+          totalErrors++;
+          processedCount++;
+          console.error('  [LOI ' + processedCount + '/' + matchedPairs.length + '] ' + pair.item.fileName + ': ' + (e && e.message ? e.message : e));
         }
-      }
+      });
     }
 
     console.log('\\n-------------------------------------------------------');
@@ -2905,16 +2931,23 @@ async function runCloudRepairNoLocal() {
   let totalErrors = 0;
 
   console.log('\\n[1/2] Dang tai danh sach bai thieu Anh bia / Lyrics tu ' + appBaseUrl + '/api/tracks ...');
-  const appRes = await fetch(appBaseUrl + '/api/tracks');
+  const appRes = await fetchWithRetry(appBaseUrl + '/api/tracks', {}, { timeoutMs: 45000, retries: 2 });
   if (!appRes.ok) {
     throw new Error('Khong the doc danh sach bai tu App (HTTP ' + appRes.status + ')');
   }
   const appTracks = await appRes.json();
-  const targets = (Array.isArray(appTracks) ? appTracks : []).filter(trackNeedsRepair);
+  const rawTargets = (Array.isArray(appTracks) ? appTracks : []).filter(trackNeedsRepair);
+  const targets = [];
+  for (const t of rawTargets) {
+    if (!t.r2AudioKey || sessionProcessedR2Keys.has(t.r2AudioKey)) continue;
+    sessionProcessedR2Keys.add(t.r2AudioKey);
+    targets.push(t);
+  }
 
   console.log('=======================================================');
   console.log(' Tong bai tren App               : ' + (Array.isArray(appTracks) ? appTracks.length : 0));
   console.log(' Can QUET BU truc tiep tu R2/App : ' + targets.length + ' bai');
+  console.log(' Toc do xu ly                   : ' + CONCURRENCY + ' luong LIEN TUC (Het toc luc)');
   console.log('=======================================================');
 
   if (targets.length === 0) {
@@ -2922,175 +2955,163 @@ async function runCloudRepairNoLocal() {
     return;
   }
 
-  let batchNo = 0;
-  for (let start = 0; start < targets.length; start += BATCH_SIZE) {
-    batchNo++;
-    const batch = targets.slice(start, start + BATCH_SIZE);
-    const remainAfter = Math.max(0, targets.length - (start + batch.length));
-    console.log('\\n[Lo Cloud #' + batchNo + '] Dang xu ly ' + batch.length + ' bai (Con lai: ' + remainAfter + ')...');
+  const startedAt = Date.now();
+  let processedCount = 0;
 
-    let cursor = 0;
-    await Promise.all(
-      Array.from({ length: Math.min(CONCURRENCY, batch.length) }).map(async () => {
-        while (cursor < batch.length) {
-          const idx = cursor++;
-          const target = batch[idx];
-          if (!target.r2AudioKey || sessionProcessedR2Keys.has(target.r2AudioKey)) continue;
-          sessionProcessedR2Keys.add(target.r2AudioKey);
-          try {
-            const cleanArtist = target.artist === 'Nghệ sĩ R2' ? '' : (target.artist || '');
-            const cleanAlbum = target.album && target.album !== 'Kho nhạc Cloudflare R2' ? target.album : '';
-            const safeDurSec = target.duration && target.duration !== 60 && target.duration !== 210 ? target.duration : undefined;
+  await runWorkerPool(targets, CONCURRENCY, async (target) => {
+    try {
+      const cleanArtist = target.artist === 'Nghệ sĩ R2' ? '' : (target.artist || '');
+      const cleanAlbum = target.album && target.album !== 'Kho nhạc Cloudflare R2' ? target.album : '';
+      const safeDurSec = target.duration && target.duration !== 60 && target.duration !== 210 ? target.duration : undefined;
 
-            const enrichRes = await fetch(SPOTFLOW_URL + '/api/metadata/enrich', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                title: target.title,
-                artist: cleanArtist,
-                album: cleanAlbum || undefined,
-                durationSec: safeDurSec,
-              }),
-            });
-            const enriched = enrichRes.ok ? await enrichRes.json() : {};
-            const title = enriched.title || target.title;
-            const artist = enriched.artist || cleanArtist;
-            const album = enriched.album || cleanAlbum || '';
-            const onlineCoverUrl = enriched.coverUrl || null;
-            const syncedLyrics = enriched.syncedLyrics || null;
-            const plainLyrics = enriched.plainLyrics || null;
+      const enrichRes = await fetchWithRetry(SPOTFLOW_URL + '/api/metadata/enrich', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: target.title,
+          artist: cleanArtist,
+          album: cleanAlbum || undefined,
+          durationSec: safeDurSec,
+        }),
+      }, { timeoutMs: 25000, retries: 2 });
+      const enriched = enrichRes.ok ? await enrichRes.json() : {};
+      const title = enriched.title || target.title;
+      const artist = enriched.artist || cleanArtist;
+      const album = enriched.album || cleanAlbum || '';
+      const onlineCoverUrl = enriched.coverUrl || null;
+      const syncedLyrics = enriched.syncedLyrics || null;
+      const plainLyrics = enriched.plainLyrics || null;
 
-            const needNewCover = !isRealCoverUrl(target.coverUrl) && Boolean(onlineCoverUrl);
-            const needLyrics = (!target.lyricsMode || target.lyricsMode === 'none') && Boolean(syncedLyrics || plainLyrics);
-            if (!needNewCover && !needLyrics) {
-              totalNoMeta++;
-              console.log('  [BO QUA] ' + (artist ? artist + ' - ' : '') + title + ' (Chua tim thay nguon lyrics/anh moi)');
-              continue;
-            }
+      const needNewCover = !isRealCoverUrl(target.coverUrl) && Boolean(onlineCoverUrl);
+      const needLyrics = (!target.lyricsMode || target.lyricsMode === 'none') && Boolean(syncedLyrics || plainLyrics);
+      if (!needNewCover && !needLyrics) {
+        totalNoMeta++;
+        processedCount++;
+        console.log('  [BO QUA ' + processedCount + '/' + targets.length + '] ' + (artist ? artist + ' - ' : '') + title + ' (Chua co nguon moi)');
+        return;
+      }
 
-            if (!target.audioUrl) {
-              throw new Error('Thieu audioUrl tren R2');
-            }
-            const audioRes = await fetch(target.audioUrl);
-            if (!audioRes.ok) {
-              throw new Error('Tai MP3 tu R2 HTTP ' + audioRes.status);
-            }
-            const rawMp3 = Buffer.from(await audioRes.arrayBuffer());
-            const embedded = extractId3v2Fallback(rawMp3, false);
+      if (!target.audioUrl) {
+        throw new Error('Thieu audioUrl tren R2');
+      }
+      const audioRes = await fetchWithRetry(target.audioUrl, {}, { timeoutMs: 45000, retries: 2 });
+      if (!audioRes.ok) {
+        throw new Error('Tai MP3 tu R2 HTTP ' + audioRes.status);
+      }
+      const rawMp3 = Buffer.from(await audioRes.arrayBuffer());
+      const embedded = extractId3v2Fallback(rawMp3, false);
 
-            let coverImg = null;
-            let coverFromExistingTarget = false;
-            if (needNewCover && onlineCoverUrl) {
-              const cRes = await fetch(onlineCoverUrl).catch(() => null);
-              if (cRes && cRes.ok) coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
-            }
-            if (!coverImg && embedded.coverBuf) {
-              coverImg = await detectImageFromBuffer(embedded.coverBuf, embedded.coverMime);
-              if (coverImg && isRealCoverUrl(target.coverUrl)) coverFromExistingTarget = true;
-            }
-            if (!coverImg && isRealCoverUrl(target.coverUrl)) {
-              const cRes = await fetch(target.coverUrl).catch(() => null);
-              if (cRes && cRes.ok) {
-                coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
-                if (coverImg) coverFromExistingTarget = true;
-              }
-            }
-
-            const taggedMp3 = writeId3v23(
-              rawMp3,
-              { title, artist, album, syncedLyrics, plainLyrics },
-              coverImg ? coverImg.buf : null,
-              coverImg ? coverImg.mime : 'image/jpeg'
-            );
-
-            const preRes = await fetch(SPOTFLOW_URL + '/api/r2/presign', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                title,
-                artist,
-                overrideAudioKey: target.r2AudioKey,
-                overrideCoverKey: target.r2CoverKey || undefined,
-                isOverwrite: true,
-                needCoverUpload: Boolean(coverImg && !coverFromExistingTarget),
-                coverExt: coverImg ? coverImg.ext : 'jpg',
-                coverContentType: coverImg ? coverImg.mime : 'image/jpeg',
-              }),
-            });
-            if (!preRes.ok) throw new Error('Presign failed: ' + (await preRes.text()));
-            const pre = await preRes.json();
-
-            const putAudio = fetch(pre.audioUploadUrl, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'audio/mpeg' },
-              body: taggedMp3,
-            });
-            const putCover = pre.coverUploadUrl && coverImg && !coverFromExistingTarget
-              ? fetch(pre.coverUploadUrl, { method: 'PUT', headers: { 'Content-Type': coverImg.mime }, body: coverImg.buf })
-              : Promise.resolve({ ok: true });
-
-            const [aPut, cPut] = await Promise.all([putAudio, putCover]);
-            if (!aPut.ok) throw new Error('R2 PUT audio HTTP ' + aPut.status);
-            if (!cPut.ok) throw new Error('R2 PUT cover HTTP ' + cPut.status);
-
-            const existingRealCover = isRealCoverUrl(target.coverUrl) ? target.coverUrl : null;
-            const finalCoverUrl = pre.coverPublicUrl || existingRealCover || onlineCoverUrl || null;
-
-            const compRes = await fetch(SPOTFLOW_URL + '/api/r2/complete-direct', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                jobId: pre.jobId,
-                trackIdOverride: target.spotifyTrackId || target.id,
-                title,
-                artist,
-                album,
-                fileName: (artist ? artist + ' - ' : '') + title + '.mp3',
-                sourceFileName: (artist ? artist + ' - ' : '') + title + '.mp3',
-                fileSizeBytes: taggedMp3.length,
-                durationMs: enriched.durationMs || (target.duration ? target.duration * 1000 : 0),
-                coverUrl: finalCoverUrl,
-                r2AudioKey: pre.audioKey,
-                r2AudioUrl: pre.audioPublicUrl,
-                r2CoverKey: pre.coverKey || target.r2CoverKey || null,
-                r2CoverUrl: pre.coverPublicUrl || existingRealCover || null,
-                syncedLyrics,
-                plainLyrics,
-                autoPush: true,
-                webhookUrl: WEBHOOK_URL,
-              }),
-            });
-            if (!compRes.ok) throw new Error('Complete HTTP ' + compRes.status);
-            const compData = await compRes.json().catch(() => ({}));
-            const pushedOk = compData && compData.job && compData.job.webhookStatus === 'pushed';
-            totalRepaired++;
-            console.log(
-              '  [BU ' + totalRepaired + '] ' + (artist ? artist + ' - ' : '') + title +
-              ' | Anh bia: ' + (coverImg || existingRealCover ? 'Co' : 'Khong') +
-              ' | Lyrics: ' + (syncedLyrics ? 'Synced' : (plainLyrics ? 'Thuong' : 'Khong')) +
-              ' | R2+USLT: OK | App: ' + (pushedOk ? 'Da cap nhat' : 'Chi len R2')
-            );
-          } catch (e) {
-            totalErrors++;
-            console.error('  [LOI] ' + target.title + ': ' + (e && e.message ? e.message : e));
-          }
+      let coverImg = null;
+      let coverFromExistingTarget = false;
+      if (needNewCover && onlineCoverUrl) {
+        const cRes = await fetchWithRetry(onlineCoverUrl, {}, { timeoutMs: 12000, retries: 1 }).catch(() => null);
+        if (cRes && cRes.ok) coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
+      }
+      if (!coverImg && embedded.coverBuf) {
+        coverImg = await detectImageFromBuffer(embedded.coverBuf, embedded.coverMime);
+        if (coverImg && isRealCoverUrl(target.coverUrl)) coverFromExistingTarget = true;
+      }
+      if (!coverImg && isRealCoverUrl(target.coverUrl)) {
+        const cRes = await fetchWithRetry(target.coverUrl, {}, { timeoutMs: 12000, retries: 1 }).catch(() => null);
+        if (cRes && cRes.ok) {
+          coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
+          if (coverImg) coverFromExistingTarget = true;
         }
-      })
-    );
+      }
 
-    if (remainAfter > 0) {
-      await new Promise((r) => setTimeout(r, 800));
+      const taggedMp3 = writeId3v23(
+        rawMp3,
+        { title, artist, album, syncedLyrics, plainLyrics },
+        coverImg ? coverImg.buf : null,
+        coverImg ? coverImg.mime : 'image/jpeg'
+      );
+
+      const preRes = await fetchWithRetry(SPOTFLOW_URL + '/api/r2/presign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title,
+          artist,
+          overrideAudioKey: target.r2AudioKey,
+          overrideCoverKey: target.r2CoverKey || undefined,
+          isOverwrite: true,
+          needCoverUpload: Boolean(coverImg && !coverFromExistingTarget),
+          coverExt: coverImg ? coverImg.ext : 'jpg',
+          coverContentType: coverImg ? coverImg.mime : 'image/jpeg',
+        }),
+      }, { timeoutMs: 20000, retries: 2 });
+      if (!preRes.ok) throw new Error('Presign failed: ' + (await preRes.text()));
+      const pre = await preRes.json();
+
+      const putAudio = fetchWithRetry(pre.audioUploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'audio/mpeg' },
+        body: taggedMp3,
+      }, { timeoutMs: 45000, retries: 2 });
+      const putCover = pre.coverUploadUrl && coverImg && !coverFromExistingTarget
+        ? fetchWithRetry(pre.coverUploadUrl, { method: 'PUT', headers: { 'Content-Type': coverImg.mime }, body: coverImg.buf }, { timeoutMs: 20000, retries: 2 })
+        : Promise.resolve({ ok: true });
+
+      const [aPut, cPut] = await Promise.all([putAudio, putCover]);
+      if (!aPut.ok) throw new Error('R2 PUT audio HTTP ' + aPut.status);
+      if (!cPut.ok) throw new Error('R2 PUT cover HTTP ' + cPut.status);
+
+      const existingRealCover = isRealCoverUrl(target.coverUrl) ? target.coverUrl : null;
+      const finalCoverUrl = pre.coverPublicUrl || existingRealCover || onlineCoverUrl || null;
+
+      const compRes = await fetchWithRetry(SPOTFLOW_URL + '/api/r2/complete-direct', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobId: pre.jobId,
+          trackIdOverride: target.spotifyTrackId || target.id,
+          title,
+          artist,
+          album,
+          fileName: (artist ? artist + ' - ' : '') + title + '.mp3',
+          sourceFileName: (artist ? artist + ' - ' : '') + title + '.mp3',
+          fileSizeBytes: taggedMp3.length,
+          durationMs: enriched.durationMs || (target.duration ? target.duration * 1000 : 0),
+          coverUrl: finalCoverUrl,
+          r2AudioKey: pre.audioKey,
+          r2AudioUrl: pre.audioPublicUrl,
+          r2CoverKey: pre.coverKey || target.r2CoverKey || null,
+          r2CoverUrl: pre.coverPublicUrl || existingRealCover || null,
+          syncedLyrics,
+          plainLyrics,
+          autoPush: true,
+          webhookUrl: WEBHOOK_URL,
+        }),
+      }, { timeoutMs: 25000, retries: 2 });
+      if (!compRes.ok) throw new Error('Complete HTTP ' + compRes.status);
+      const compData = await compRes.json().catch(() => ({}));
+      const pushedOk = compData && compData.job && compData.job.webhookStatus === 'pushed';
+      totalRepaired++;
+      processedCount++;
+      const pct = Math.round((processedCount / targets.length) * 100);
+      console.log(
+        '  [BU ' + processedCount + '/' + targets.length + ' · ' + pct + '% · ' + formatRate(processedCount, startedAt) + '] ' +
+        (artist ? artist + ' - ' : '') + title +
+        ' | Anh: ' + (coverImg || existingRealCover ? 'Co' : 'Khong') +
+        ' | Lyrics: ' + (syncedLyrics ? 'Synced' : (plainLyrics ? 'Thuong' : 'Khong')) +
+        ' | R2+USLT: OK | App: ' + (pushedOk ? 'OK' : 'R2')
+      );
+    } catch (e) {
+      totalErrors++;
+      processedCount++;
+      console.error('  [LOI ' + processedCount + '/' + targets.length + '] ' + target.title + ': ' + (e && e.message ? e.message : e));
     }
-  }
+  });
 
+  const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
   console.log('\\n=======================================================');
-  console.log(' Hoan tat QUET BU TU R2/APP -> Da bu: ' + totalRepaired + ' | Chua co nguon: ' + totalNoMeta + ' | Loi: ' + totalErrors);
+  console.log(' Hoan tat QUET BU TU R2/APP (' + elapsedSec + 's) -> Da bu: ' + totalRepaired + ' | Chua co nguon: ' + totalNoMeta + ' | Loi: ' + totalErrors);
   console.log('=======================================================');
 }
 
 async function run() {
   console.log('=======================================================');
-  console.log(' SpotFlow Windows Direct-to-R2 Tool');
+  console.log(' SpotFlow Windows Direct-to-R2 Tool (FULL SPEED ' + CONCURRENCY + ' LUONG)');
   console.log(' Server  : ' + SPOTFLOW_URL);
   console.log(' Thu muc : ' + (FOLDER_PATH || '(Chua dat)'));
   console.log(' Webhook : ' + (WEBHOOK_URL || '(Chua luu tren server)'));
@@ -3100,19 +3121,19 @@ async function run() {
   if (mode !== 'sync' && mode !== 'repair' && mode !== 'cloud') {
     console.log('');
     console.log('Chon che do hoat dong:');
-    console.log('  [1] Quet & Tai BAI MOI tu thu muc may tinh (loc trung theo lich su)');
-    console.log('  [2] Quet BU Anh bia & Lyrics tu thu muc MP3 tren may tinh');
+    console.log('  [1] Quet & Tai BAI MOI tu thu muc may tinh (chay het toc luc, loc trung lich su)');
+    console.log('  [2] Quet BU Anh bia & Lyrics tu thu muc MP3 tren may tinh (chay het toc luc)');
     console.log('  [3] Quet BU truc tiep tu App/R2 (KHONG CAN thu muc tren may, nhung USLT vao MP3 R2)');
     const ans = await askPrompt('Nhap 1, 2 hoac 3 (Enter = 1): ');
     mode = ans === '3' ? 'cloud' : ans === '2' ? 'repair' : 'sync';
   }
 
   if (mode === 'cloud') {
-    console.log('\\n>>> CHE DO 3: QUET BU TRUC TIEP TU APP/R2 (KHONG CAN FILE TREN MAY) <<<');
+    console.log('\\n>>> CHE DO 3: QUET BU TRUC TIEP TU APP/R2 (HET TOC LUC ' + CONCURRENCY + ' LUONG) <<<');
   } else if (mode === 'repair') {
-    console.log('\\n>>> CHE DO 2: QUET BU ANH BIA & LYRICS TU THU MUC MAY (GHI DE CHUAN R2) <<<');
+    console.log('\\n>>> CHE DO 2: QUET BU ANH BIA & LYRICS TU THU MUC MAY (HET TOC LUC ' + CONCURRENCY + ' LUONG) <<<');
   } else {
-    console.log('\\n>>> CHE DO 1: QUET & TAI BAI MOI (50 BAI/LUOT) <<<');
+    console.log('\\n>>> CHE DO 1: QUET & TAI BAI MOI (HET TOC LUC ' + CONCURRENCY + ' LUONG LIEN TUC) <<<');
   }
 
   if (mode !== 'cloud') {
@@ -3149,6 +3170,7 @@ run().catch((err) => {
       `set "FOLDER_PATH=${safeBatString(rawFolder)}"`,
       `set "WEBHOOK_URL=${safeBatString(webhookUrl)}"`,
       `set "SYNC_MODE=${safeBatString(syncMode)}"`,
+      'set "SYNC_CONCURRENCY=10"',
       'where node >nul 2>nul',
       'if errorlevel 1 (',
       '  echo [SpotFlow] May chua cai Node.js. Dang cai dat Node.js LTS...',
