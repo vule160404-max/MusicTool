@@ -13,6 +13,7 @@ import {
   DeleteObjectCommand,
   GetBucketCorsCommand,
   HeadBucketCommand,
+  ListObjectsV2Command,
   PutBucketCorsCommand,
   PutObjectCommand,
   S3Client,
@@ -2168,7 +2169,14 @@ async function startServer() {
     const rawServerUrl = String(req.query.serverUrl || `${proto}://${host}`).trim().replace(/\/+$/, '');
     const webhookUrl = String(req.query.webhookUrl || integrationSettings.webhookUrl || '').trim();
     const rawMode = String(req.query.mode || 'menu').trim().toLowerCase();
-    const syncMode = rawMode === 'repair' ? 'repair' : rawMode === 'sync' ? 'sync' : 'menu';
+    const syncMode =
+      rawMode === 'repair'
+        ? 'repair'
+        : rawMode === 'sync'
+        ? 'sync'
+        : rawMode === 'cloud'
+        ? 'cloud'
+        : 'menu';
 
     const safeBatString = (s: string) => s.replace(/["\r\n]/g, '').trim();
 
@@ -2889,6 +2897,197 @@ async function runRepairBackfill() {
   console.log('\\n[Hoan tat QUET BU] Da cap nhat ' + totalRepaired + ' bai len R2 & App Nhac (khong tao trung)!')
 }
 
+async function runCloudRepairNoLocal() {
+  const appBaseUrl = getAppBaseUrl(WEBHOOK_URL);
+  const sessionProcessedR2Keys = new Set();
+  let totalRepaired = 0;
+  let totalNoMeta = 0;
+  let totalErrors = 0;
+
+  console.log('\\n[1/2] Dang tai danh sach bai thieu Anh bia / Lyrics tu ' + appBaseUrl + '/api/tracks ...');
+  const appRes = await fetch(appBaseUrl + '/api/tracks');
+  if (!appRes.ok) {
+    throw new Error('Khong the doc danh sach bai tu App (HTTP ' + appRes.status + ')');
+  }
+  const appTracks = await appRes.json();
+  const targets = (Array.isArray(appTracks) ? appTracks : []).filter(trackNeedsRepair);
+
+  console.log('=======================================================');
+  console.log(' Tong bai tren App               : ' + (Array.isArray(appTracks) ? appTracks.length : 0));
+  console.log(' Can QUET BU truc tiep tu R2/App : ' + targets.length + ' bai');
+  console.log('=======================================================');
+
+  if (targets.length === 0) {
+    console.log('[Hoan tat] Tat ca bai hat tren App/R2 deu da co du Anh bia & Lyrics!');
+    return;
+  }
+
+  let batchNo = 0;
+  for (let start = 0; start < targets.length; start += BATCH_SIZE) {
+    batchNo++;
+    const batch = targets.slice(start, start + BATCH_SIZE);
+    const remainAfter = Math.max(0, targets.length - (start + batch.length));
+    console.log('\\n[Lo Cloud #' + batchNo + '] Dang xu ly ' + batch.length + ' bai (Con lai: ' + remainAfter + ')...');
+
+    let cursor = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, batch.length) }).map(async () => {
+        while (cursor < batch.length) {
+          const idx = cursor++;
+          const target = batch[idx];
+          if (!target.r2AudioKey || sessionProcessedR2Keys.has(target.r2AudioKey)) continue;
+          sessionProcessedR2Keys.add(target.r2AudioKey);
+          try {
+            const cleanArtist = target.artist === 'Nghệ sĩ R2' ? '' : (target.artist || '');
+            const cleanAlbum = target.album && target.album !== 'Kho nhạc Cloudflare R2' ? target.album : '';
+            const safeDurSec = target.duration && target.duration !== 60 && target.duration !== 210 ? target.duration : undefined;
+
+            const enrichRes = await fetch(SPOTFLOW_URL + '/api/metadata/enrich', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                title: target.title,
+                artist: cleanArtist,
+                album: cleanAlbum || undefined,
+                durationSec: safeDurSec,
+              }),
+            });
+            const enriched = enrichRes.ok ? await enrichRes.json() : {};
+            const title = enriched.title || target.title;
+            const artist = enriched.artist || cleanArtist;
+            const album = enriched.album || cleanAlbum || '';
+            const onlineCoverUrl = enriched.coverUrl || null;
+            const syncedLyrics = enriched.syncedLyrics || null;
+            const plainLyrics = enriched.plainLyrics || null;
+
+            const needNewCover = !isRealCoverUrl(target.coverUrl) && Boolean(onlineCoverUrl);
+            const needLyrics = (!target.lyricsMode || target.lyricsMode === 'none') && Boolean(syncedLyrics || plainLyrics);
+            if (!needNewCover && !needLyrics) {
+              totalNoMeta++;
+              console.log('  [BO QUA] ' + (artist ? artist + ' - ' : '') + title + ' (Chua tim thay nguon lyrics/anh moi)');
+              continue;
+            }
+
+            if (!target.audioUrl) {
+              throw new Error('Thieu audioUrl tren R2');
+            }
+            const audioRes = await fetch(target.audioUrl);
+            if (!audioRes.ok) {
+              throw new Error('Tai MP3 tu R2 HTTP ' + audioRes.status);
+            }
+            const rawMp3 = Buffer.from(await audioRes.arrayBuffer());
+            const embedded = extractId3v2Fallback(rawMp3, false);
+
+            let coverImg = null;
+            let coverFromExistingTarget = false;
+            if (needNewCover && onlineCoverUrl) {
+              const cRes = await fetch(onlineCoverUrl).catch(() => null);
+              if (cRes && cRes.ok) coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
+            }
+            if (!coverImg && embedded.coverBuf) {
+              coverImg = await detectImageFromBuffer(embedded.coverBuf, embedded.coverMime);
+              if (coverImg && isRealCoverUrl(target.coverUrl)) coverFromExistingTarget = true;
+            }
+            if (!coverImg && isRealCoverUrl(target.coverUrl)) {
+              const cRes = await fetch(target.coverUrl).catch(() => null);
+              if (cRes && cRes.ok) {
+                coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
+                if (coverImg) coverFromExistingTarget = true;
+              }
+            }
+
+            const taggedMp3 = writeId3v23(
+              rawMp3,
+              { title, artist, album, syncedLyrics, plainLyrics },
+              coverImg ? coverImg.buf : null,
+              coverImg ? coverImg.mime : 'image/jpeg'
+            );
+
+            const preRes = await fetch(SPOTFLOW_URL + '/api/r2/presign', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                title,
+                artist,
+                overrideAudioKey: target.r2AudioKey,
+                overrideCoverKey: target.r2CoverKey || undefined,
+                isOverwrite: true,
+                needCoverUpload: Boolean(coverImg && !coverFromExistingTarget),
+                coverExt: coverImg ? coverImg.ext : 'jpg',
+                coverContentType: coverImg ? coverImg.mime : 'image/jpeg',
+              }),
+            });
+            if (!preRes.ok) throw new Error('Presign failed: ' + (await preRes.text()));
+            const pre = await preRes.json();
+
+            const putAudio = fetch(pre.audioUploadUrl, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'audio/mpeg' },
+              body: taggedMp3,
+            });
+            const putCover = pre.coverUploadUrl && coverImg && !coverFromExistingTarget
+              ? fetch(pre.coverUploadUrl, { method: 'PUT', headers: { 'Content-Type': coverImg.mime }, body: coverImg.buf })
+              : Promise.resolve({ ok: true });
+
+            const [aPut, cPut] = await Promise.all([putAudio, putCover]);
+            if (!aPut.ok) throw new Error('R2 PUT audio HTTP ' + aPut.status);
+            if (!cPut.ok) throw new Error('R2 PUT cover HTTP ' + cPut.status);
+
+            const existingRealCover = isRealCoverUrl(target.coverUrl) ? target.coverUrl : null;
+            const finalCoverUrl = pre.coverPublicUrl || existingRealCover || onlineCoverUrl || null;
+
+            const compRes = await fetch(SPOTFLOW_URL + '/api/r2/complete-direct', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jobId: pre.jobId,
+                trackIdOverride: target.spotifyTrackId || target.id,
+                title,
+                artist,
+                album,
+                fileName: (artist ? artist + ' - ' : '') + title + '.mp3',
+                sourceFileName: (artist ? artist + ' - ' : '') + title + '.mp3',
+                fileSizeBytes: taggedMp3.length,
+                durationMs: enriched.durationMs || (target.duration ? target.duration * 1000 : 0),
+                coverUrl: finalCoverUrl,
+                r2AudioKey: pre.audioKey,
+                r2AudioUrl: pre.audioPublicUrl,
+                r2CoverKey: pre.coverKey || target.r2CoverKey || null,
+                r2CoverUrl: pre.coverPublicUrl || existingRealCover || null,
+                syncedLyrics,
+                plainLyrics,
+                autoPush: true,
+                webhookUrl: WEBHOOK_URL,
+              }),
+            });
+            if (!compRes.ok) throw new Error('Complete HTTP ' + compRes.status);
+            const compData = await compRes.json().catch(() => ({}));
+            const pushedOk = compData && compData.job && compData.job.webhookStatus === 'pushed';
+            totalRepaired++;
+            console.log(
+              '  [BU ' + totalRepaired + '] ' + (artist ? artist + ' - ' : '') + title +
+              ' | Anh bia: ' + (coverImg || existingRealCover ? 'Co' : 'Khong') +
+              ' | Lyrics: ' + (syncedLyrics ? 'Synced' : (plainLyrics ? 'Thuong' : 'Khong')) +
+              ' | R2+USLT: OK | App: ' + (pushedOk ? 'Da cap nhat' : 'Chi len R2')
+            );
+          } catch (e) {
+            totalErrors++;
+            console.error('  [LOI] ' + target.title + ': ' + (e && e.message ? e.message : e));
+          }
+        }
+      })
+    );
+
+    if (remainAfter > 0) {
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  }
+
+  console.log('\\n=======================================================');
+  console.log(' Hoan tat QUET BU TU R2/APP -> Da bu: ' + totalRepaired + ' | Chua co nguon: ' + totalNoMeta + ' | Loi: ' + totalErrors);
+  console.log('=======================================================');
+}
+
 async function run() {
   console.log('=======================================================');
   console.log(' SpotFlow Windows Direct-to-R2 Tool');
@@ -2898,31 +3097,38 @@ async function run() {
   console.log('=======================================================');
 
   let mode = DEFAULT_SYNC_MODE;
-  if (mode !== 'sync' && mode !== 'repair') {
+  if (mode !== 'sync' && mode !== 'repair' && mode !== 'cloud') {
     console.log('');
     console.log('Chon che do hoat dong:');
-    console.log('  [1] Quet & Tai BAI MOI (loc trung theo lich su)');
-    console.log('  [2] Quet BU Anh bia & Lyrics cho ~1.900+ bai da up bi thieu tren App/R2');
-    const ans = await askPrompt('Nhap 1 hoac 2 (Enter = 1): ');
-    mode = ans === '2' ? 'repair' : 'sync';
+    console.log('  [1] Quet & Tai BAI MOI tu thu muc may tinh (loc trung theo lich su)');
+    console.log('  [2] Quet BU Anh bia & Lyrics tu thu muc MP3 tren may tinh');
+    console.log('  [3] Quet BU truc tiep tu App/R2 (KHONG CAN thu muc tren may, nhung USLT vao MP3 R2)');
+    const ans = await askPrompt('Nhap 1, 2 hoac 3 (Enter = 1): ');
+    mode = ans === '3' ? 'cloud' : ans === '2' ? 'repair' : 'sync';
   }
 
-  if (mode === 'repair') {
-    console.log('\\n>>> CHE DO 2: QUET BU ANH BIA & LYRICS (GHI DE CHUAN R2, KHONG TRUNG BAI) <<<');
+  if (mode === 'cloud') {
+    console.log('\\n>>> CHE DO 3: QUET BU TRUC TIEP TU APP/R2 (KHONG CAN FILE TREN MAY) <<<');
+  } else if (mode === 'repair') {
+    console.log('\\n>>> CHE DO 2: QUET BU ANH BIA & LYRICS TU THU MUC MAY (GHI DE CHUAN R2) <<<');
   } else {
     console.log('\\n>>> CHE DO 1: QUET & TAI BAI MOI (50 BAI/LUOT) <<<');
   }
 
-  const typedFolder = (await askPrompt('Thu muc MP3 [' + FOLDER_PATH + '] (An Enter de giu nguyen hoac dan duong dan khac): '))
-    .replace(/^["']+|["']+$/g, '');
-  if (typedFolder) FOLDER_PATH = typedFolder;
+  if (mode !== 'cloud') {
+    const typedFolder = (await askPrompt('Thu muc MP3 [' + FOLDER_PATH + '] (An Enter de giu nguyen hoac dan duong dan khac): '))
+      .replace(/^["']+|["']+$/g, '');
+    if (typedFolder) FOLDER_PATH = typedFolder;
+  }
 
   if (!WEBHOOK_URL) {
     const typedWebhook = await askPrompt('Chua co Webhook URL. Dan URL Webhook App Nhac (hoac Enter de bo qua): ');
     if (typedWebhook) WEBHOOK_URL = typedWebhook;
   }
 
-  if (mode === 'repair') {
+  if (mode === 'cloud') {
+    await runCloudRepairNoLocal();
+  } else if (mode === 'repair') {
     await runRepairBackfill();
   } else {
     await runNormalSync();
@@ -2960,7 +3166,12 @@ run().catch((err) => {
       nodeAgentCode,
     ].join('\r\n');
 
-    const downloadFileName = syncMode === 'repair' ? 'SpotFlow-QuetBu-R2.bat' : 'SpotFlow-AutoSync.bat';
+    const downloadFileName =
+      syncMode === 'cloud'
+        ? 'SpotFlow-QuetBu-Cloud-R2.bat'
+        : syncMode === 'repair'
+        ? 'SpotFlow-QuetBu-R2.bat'
+        : 'SpotFlow-AutoSync.bat';
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${downloadFileName}"`);
     res.send(Buffer.from(batContent, 'utf8'));
@@ -3031,6 +3242,437 @@ run().catch((err) => {
 
   app.post('/api/metadata/enrich', handleMetadataEnrich);
   app.post('/api/local/enrich', handleMetadataEnrich);
+
+  const decodeId3TextServer = (buf: Buffer): string => {
+    if (!buf || buf.length === 0) return '';
+    const enc = buf[0];
+    const body = buf.subarray(1);
+    if (enc === 0 || enc === 3) {
+      return body.toString('utf8').replace(/\0+$/g, '').trim();
+    }
+    if (enc === 1 || enc === 2) {
+      let start = 0;
+      let isBe = enc === 2;
+      if (body.length >= 2 && body[0] === 0xff && body[1] === 0xfe) {
+        start = 2;
+        isBe = false;
+      } else if (body.length >= 2 && body[0] === 0xfe && body[1] === 0xff) {
+        start = 2;
+        isBe = true;
+      }
+      let slice = body.subarray(start);
+      if (isBe) {
+        slice = Buffer.from(slice);
+        slice.swap16();
+      }
+      return slice.toString('utf16le').replace(/\0+$/g, '').trim();
+    }
+    return body.toString('utf8').replace(/\0+$/g, '').trim();
+  };
+
+  const parseQuickId3MetaServer = (buf: Buffer): { title: string; artist: string; album: string } => {
+    const out = { title: '', artist: '', album: '' };
+    if (!buf || buf.length < 10 || buf[0] !== 0x49 || buf[1] !== 0x44 || buf[2] !== 0x33) return out;
+    const ver = buf[3];
+    const tagSize = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+    const end = Math.min(buf.length, 10 + tagSize);
+    let pos = 10;
+    if (buf[5] & 0x40 && pos + 4 <= end) {
+      const extSize =
+        ver === 4
+          ? ((buf[pos] & 0x7f) << 21) | ((buf[pos + 1] & 0x7f) << 14) | ((buf[pos + 2] & 0x7f) << 7) | (buf[pos + 3] & 0x7f)
+          : buf.readUInt32BE(pos);
+      pos += ver === 4 ? extSize : extSize + 4;
+    }
+    while (pos + 10 <= end) {
+      const id = buf.subarray(pos, pos + 4).toString('ascii');
+      if (!/^[A-Z0-9]{4}$/.test(id)) break;
+      const fsize =
+        ver === 4
+          ? ((buf[pos + 4] & 0x7f) << 21) | ((buf[pos + 5] & 0x7f) << 14) | ((buf[pos + 6] & 0x7f) << 7) | (buf[pos + 7] & 0x7f)
+          : buf.readUInt32BE(pos + 4);
+      pos += 10;
+      if (fsize <= 0 || pos + fsize > end) break;
+      const data = buf.subarray(pos, pos + fsize);
+      pos += fsize;
+      if (id === 'TIT2' && !out.title) out.title = decodeId3TextServer(data);
+      else if (id === 'TPE1' && !out.artist) out.artist = decodeId3TextServer(data);
+      else if (id === 'TALB' && !out.album) out.album = decodeId3TextServer(data);
+    }
+    return out;
+  };
+
+  interface SoundlyAppTrackItem {
+    id?: string;
+    spotifyTrackId?: string;
+    title?: string;
+    artist?: string;
+    album?: string;
+    duration?: number;
+    audioUrl?: string;
+    r2AudioKey?: string;
+    coverUrl?: string;
+    r2CoverKey?: string;
+    lyricsMode?: string;
+  }
+
+  app.post('/api/cloud/scan-missing', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {
+        appUrl?: string;
+        webhookUrl?: string;
+        includeR2?: boolean;
+      };
+      const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
+      let appOrigin = 'https://soundly-psi.vercel.app';
+      const urlCandidate = (body.appUrl || effectiveWebhook || '').trim();
+      if (urlCandidate) {
+        try {
+          appOrigin = new URL(urlCandidate).origin;
+        } catch {
+          // Fallback to soundly origin
+        }
+      }
+
+      const appRes = await fetch(`${appOrigin}/api/tracks`, {
+        signal: AbortSignal.timeout(40000),
+      });
+      if (!appRes.ok) {
+        res.status(502).json({ error: `Không thể đọc danh sách bài hát từ App (${appRes.status}).` });
+        return;
+      }
+
+      const appTracksRaw = (await appRes.json()) as unknown;
+      const appTracks: SoundlyAppTrackItem[] = Array.isArray(appTracksRaw)
+        ? (appTracksRaw as SoundlyAppTrackItem[])
+        : [];
+
+      const isRealCover = (u?: string) => {
+        const clean = String(u || '').trim();
+        return (
+          Boolean(clean) &&
+          !clean.includes('unsplash.com') &&
+          !clean.includes('soundly-default-cover') &&
+          /^https?:\/\//i.test(clean)
+        );
+      };
+
+      const appKeySet = new Set<string>();
+      const missingTracks: Array<{
+        id: string;
+        spotifyTrackId?: string;
+        title: string;
+        artist: string;
+        album: string;
+        duration: number;
+        audioUrl: string;
+        r2AudioKey: string;
+        coverUrl: string;
+        r2CoverKey?: string;
+        lyricsMode?: string;
+        missingCover: boolean;
+        missingLyrics: boolean;
+        isOrphanR2?: boolean;
+      }> = [];
+
+      let missingLyricsCount = 0;
+      let missingCoverCount = 0;
+
+      for (const t of appTracks) {
+        if (t.r2AudioKey) appKeySet.add(t.r2AudioKey);
+        const needCover = !isRealCover(t.coverUrl);
+        const needLyrics = !t.lyricsMode || t.lyricsMode === 'none';
+        const genericAlbum = t.album === 'Kho nhạc Cloudflare R2';
+        if (needCover) missingCoverCount++;
+        if (needLyrics) missingLyricsCount++;
+
+        if (needCover || needLyrics || genericAlbum) {
+          missingTracks.push({
+            id: String(t.id || ''),
+            spotifyTrackId: t.spotifyTrackId,
+            title: String(t.title || 'Unknown Track'),
+            artist: String(t.artist || ''),
+            album: String(t.album || ''),
+            duration: Number(t.duration) || 0,
+            audioUrl: String(t.audioUrl || ''),
+            r2AudioKey: String(t.r2AudioKey || ''),
+            coverUrl: String(t.coverUrl || ''),
+            r2CoverKey: t.r2CoverKey,
+            lyricsMode: t.lyricsMode,
+            missingCover: needCover,
+            missingLyrics: needLyrics,
+          });
+        }
+      }
+
+      let r2TotalCount: number | null = null;
+      let orphanR2Count = 0;
+      const r2 = integrationSettings.r2;
+      if (body.includeR2 !== false && r2.enabled && validateR2Config(r2) === null) {
+        try {
+          const client = getR2Client(r2);
+          const publicBase = normalizePublicBaseUrl(r2.publicBaseUrl);
+          let continuationToken: string | undefined;
+          let pages = 0;
+          let totalR2Mp3 = 0;
+          while (pages < 10) {
+            pages++;
+            const listOut = await client.send(
+              new ListObjectsV2Command({
+                Bucket: r2.bucketName,
+                Prefix: 'tracks/',
+                MaxKeys: 1000,
+                ContinuationToken: continuationToken,
+              })
+            );
+            for (const obj of listOut.Contents || []) {
+              const key = obj.Key || '';
+              if (!/\.mp3$/i.test(key)) continue;
+              totalR2Mp3++;
+              if (!appKeySet.has(key)) {
+                orphanR2Count++;
+                const stem = key
+                  .replace(/^tracks\//i, '')
+                  .replace(/\.mp3$/i, '')
+                  .replace(/-[0-9a-f]{8}$/i, '')
+                  .replace(/-\d{10,14}$/i, '')
+                  .replace(/-/g, ' ');
+                const guessed = parseTrackFilename(`${stem}.mp3`);
+                missingTracks.push({
+                  id: `r2-${slugifyR2Segment(key.replace(/^tracks\//i, ''))}_mp3`,
+                  title: guessed.title || stem || 'Unknown Track',
+                  artist: guessed.artist || '',
+                  album: '',
+                  duration: 0,
+                  audioUrl: `${publicBase}/${key}`,
+                  r2AudioKey: key,
+                  coverUrl: '',
+                  lyricsMode: 'none',
+                  missingCover: true,
+                  missingLyrics: true,
+                  isOrphanR2: true,
+                });
+              }
+            }
+            if (!listOut.IsTruncated || !listOut.NextContinuationToken) break;
+            continuationToken = listOut.NextContinuationToken;
+          }
+          r2TotalCount = totalR2Mp3;
+        } catch {
+          // Ignore R2 listing errors; App scan remains intact
+        }
+      }
+
+      res.json({
+        ok: true,
+        appOrigin,
+        webhookConfigured: Boolean(effectiveWebhook),
+        totalAppTracks: appTracks.length,
+        r2TotalCount,
+        missingLyricsCount,
+        missingCoverCount,
+        orphanR2Count,
+        tracks: missingTracks,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Không thể quét danh sách bài hát trên App/R2.',
+      });
+    }
+  });
+
+  app.post('/api/cloud/backfill-track', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {
+        track?: {
+          id?: string;
+          spotifyTrackId?: string;
+          title?: string;
+          artist?: string;
+          album?: string;
+          duration?: number;
+          audioUrl?: string;
+          r2AudioKey?: string;
+          coverUrl?: string;
+          r2CoverKey?: string;
+          missingCover?: boolean;
+          missingLyrics?: boolean;
+          isOrphanR2?: boolean;
+        };
+        webhookUrl?: string;
+      };
+
+      const t = body.track;
+      if (!t || (!t.title && !t.r2AudioKey)) {
+        res.status(400).json({ error: 'Thiếu thông tin bài hát cần quét bù.' });
+        return;
+      }
+
+      const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
+      let title = String(t.title || 'Unknown Track').trim();
+      let artist = String(t.artist === 'Nghệ sĩ R2' ? '' : t.artist || '').trim();
+      let album = String(t.album && t.album !== 'Kho nhạc Cloudflare R2' ? t.album : '').trim();
+
+      // For orphan R2 MP3s (not listed on App), peek ID3 header via Range request to recover exact title/artist
+      if (t.isOrphanR2 && t.audioUrl) {
+        try {
+          const rangeRes = await fetch(t.audioUrl, {
+            headers: { Range: 'bytes=0-32767' },
+            signal: AbortSignal.timeout(6000),
+          });
+          if (rangeRes.ok) {
+            const headBuf = Buffer.from(await rangeRes.arrayBuffer());
+            const hdr = parseQuickId3MetaServer(headBuf);
+            if (hdr.title) title = hdr.title;
+            if (hdr.artist) artist = hdr.artist;
+            if (hdr.album && !album) album = hdr.album;
+          }
+        } catch {
+          // Fallback to slug-guessed title/artist
+        }
+      }
+
+      const safeDurSec =
+        t.duration && t.duration > 30 && t.duration !== 60 && t.duration !== 210
+          ? Number(t.duration)
+          : undefined;
+
+      const enriched = await enrichTrackMetadata({
+        title,
+        artist,
+        album: album || undefined,
+        durationSec: safeDurSec,
+      });
+
+      const finalTitle = enriched.title || title;
+      const finalArtist = enriched.artist || artist;
+      const finalAlbum = enriched.album || album || '';
+      const syncedLyrics = enriched.syncedLyrics || null;
+      const plainLyrics = enriched.plainLyrics || null;
+
+      const isRealCover = (u?: string | null) => {
+        const clean = String(u || '').trim();
+        return (
+          Boolean(clean) &&
+          !clean.includes('unsplash.com') &&
+          !clean.includes('soundly-default-cover') &&
+          /^https?:\/\//i.test(clean)
+        );
+      };
+
+      const existingRealCover = isRealCover(t.coverUrl) ? String(t.coverUrl).trim() : null;
+      let newR2CoverUrl: string | null = null;
+      let newR2CoverKey: string | null = null;
+
+      if (!existingRealCover && enriched.coverUrl) {
+        const r2 = integrationSettings.r2;
+        if (r2.enabled && validateR2Config(r2) === null) {
+          try {
+            const coverBuf = await downloadFileBuffer(enriched.coverUrl);
+            if (coverBuf && coverBuf.length > 400) {
+              const { ext, contentType } = detectImageType(coverBuf);
+              const audioStem = t.r2AudioKey
+                ? t.r2AudioKey.replace(/^tracks\//i, '').replace(/\.mp3$/i, '')
+                : `${slugifyR2Segment(`${finalArtist ? `${finalArtist}-` : ''}${finalTitle}`)}-${crypto
+                    .randomBytes(4)
+                    .toString('hex')}`;
+              const coverKey = t.r2CoverKey || `covers/${audioStem}.${ext}`;
+              const client = getR2Client(r2);
+              await client.send(
+                new PutObjectCommand({
+                  Bucket: r2.bucketName,
+                  Key: coverKey,
+                  Body: coverBuf,
+                  ContentType: contentType,
+                  CacheControl: 'public, max-age=86400',
+                })
+              );
+              const publicBase = normalizePublicBaseUrl(r2.publicBaseUrl);
+              newR2CoverKey = coverKey;
+              newR2CoverUrl = `${publicBase}/${coverKey}`;
+            }
+          } catch {
+            // Fall back to direct online coverUrl if R2 cover upload fails
+          }
+        }
+      }
+
+      const finalCoverUrl = newR2CoverUrl || existingRealCover || enriched.coverUrl || null;
+      const gainedLyrics = Boolean(t.missingLyrics && (syncedLyrics || plainLyrics));
+      const gainedCover = Boolean(!existingRealCover && finalCoverUrl);
+      const gainedAlbum = Boolean(t.album === 'Kho nhạc Cloudflare R2' && finalAlbum);
+
+      if (!t.isOrphanR2 && !gainedLyrics && !gainedCover && !gainedAlbum) {
+        res.json({
+          status: 'no_source',
+          title: finalTitle,
+          artist: finalArtist,
+          album: finalAlbum,
+          coverUrl: finalCoverUrl,
+          lyricsType: 'Khong',
+          hasNewCover: false,
+        });
+        return;
+      }
+
+      if (!effectiveWebhook) {
+        res.status(400).json({ error: 'Chưa cấu hình Webhook URL để cập nhật lên App Nhạc.' });
+        return;
+      }
+
+      const jobId = `cloud_${crypto.randomBytes(6).toString('hex')}`;
+      const r2PublicBase = normalizePublicBaseUrl(integrationSettings.r2.publicBaseUrl);
+      const resolvedAudioUrl =
+        (t.audioUrl && t.audioUrl.trim()) ||
+        (t.r2AudioKey && r2PublicBase ? `${r2PublicBase}/${t.r2AudioKey}` : '');
+
+      const job: DownloadJob = {
+        jobId,
+        trackId: t.spotifyTrackId || t.id || jobId,
+        title: finalTitle,
+        artist: finalArtist,
+        album: finalAlbum,
+        bitrate: 320,
+        state: 'done',
+        progress: 100,
+        message: 'Quét bù Cloud hoàn tất',
+        filePath: null,
+        fileName: sanitizeFileName(`${finalArtist ? `${finalArtist} - ` : ''}${finalTitle}.mp3`),
+        fileSizeBytes: null,
+        error: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        coverUrl: finalCoverUrl,
+        durationMs: t.duration && t.duration > 30 ? t.duration * 1000 : enriched.durationMs || 0,
+        syncedLyrics,
+        plainLyrics,
+        r2AudioKey: t.r2AudioKey || null,
+        r2AudioUrl: resolvedAudioUrl || null,
+        r2CoverKey: newR2CoverKey || t.r2CoverKey || null,
+        r2CoverUrl: finalCoverUrl,
+        storageProvider: resolvedAudioUrl ? 'r2' : 'spotflow',
+      };
+
+      const reqHost = req.get('host') || 'localhost:3000';
+      const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+      const pushOutcome = await pushJobToWebhook(job, reqHost, reqProtocol, effectiveWebhook);
+
+      res.json({
+        status: pushOutcome.success ? 'updated' : 'webhook_error',
+        message: pushOutcome.message,
+        title: finalTitle,
+        artist: finalArtist,
+        album: finalAlbum,
+        coverUrl: finalCoverUrl,
+        lyricsType: syncedLyrics ? 'Synced' : plainLyrics ? 'Thuong' : 'Khong',
+        hasNewCover: gainedCover,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Lỗi quét bù bài hát trên Cloud.',
+      });
+    }
+  });
 
   app.post('/api/lyrics/search', async (req: Request, res: Response) => {
     try {
