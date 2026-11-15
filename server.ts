@@ -2533,6 +2533,7 @@ async function processTrackAndUpload(opts) {
   }
 
   let coverImg = null;
+  let coverFromExistingTarget = false;
   if (onlineCoverUrl) {
     const cRes = await fetch(onlineCoverUrl).catch(() => null);
     if (cRes && cRes.ok) {
@@ -2546,13 +2547,14 @@ async function processTrackAndUpload(opts) {
     const cRes = await fetch(overrideTarget.coverUrl).catch(() => null);
     if (cRes && cRes.ok) {
       coverImg = await detectImageFromBuffer(Buffer.from(await cRes.arrayBuffer()));
+      if (coverImg) coverFromExistingTarget = true;
     }
   }
 
   if (overrideTarget) {
     const hadRealCover = isRealCoverUrl(overrideTarget.coverUrl);
     const hadLyrics = Boolean(overrideTarget.lyricsMode && overrideTarget.lyricsMode !== 'none');
-    const gainedNewInfo = Boolean(coverImg || syncedLyrics || plainLyrics || album);
+    const gainedNewInfo = Boolean((coverImg && !coverFromExistingTarget) || syncedLyrics || plainLyrics || album);
     if (!gainedNewInfo && !hadRealCover && !hadLyrics) {
       return { skippedNoMeta: true, title, artist };
     }
@@ -2568,7 +2570,7 @@ async function processTrackAndUpload(opts) {
   const preBody = {
     title,
     artist,
-    needCoverUpload: Boolean(coverImg),
+    needCoverUpload: Boolean(coverImg && !coverFromExistingTarget),
     coverExt: coverImg ? coverImg.ext : 'jpg',
     coverContentType: coverImg ? coverImg.mime : 'image/jpeg',
   };
@@ -2661,7 +2663,9 @@ async function runNormalSync() {
     const histJson = await histRes.json();
     const histItems = Array.isArray(histJson.items) ? histJson.items : [];
     const histFileKeys = new Set(histItems.map((h) => h.fileKey).filter(Boolean));
-    const histTrackKeys = new Set(histItems.map((h) => h.trackKey).filter(Boolean));
+    const histTrackKeys = new Set(
+      histItems.map((h) => String(h.trackKey || '').replace(/::/g, '__')).filter(Boolean)
+    );
 
     const { outAudio, outLrc } = await scanFolder(FOLDER_PATH);
     outAudio.sort((a, b) => a.fileName.localeCompare(b.fileName, 'vi'));
