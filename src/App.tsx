@@ -82,11 +82,60 @@ export default function App() {
       const res = await apiFetch('/api/integration/settings');
       if (!res.ok) return;
       const data = (await res.json()) as IntegrationConfig;
+      let savedWebhook = '';
+      try {
+        savedWebhook = (localStorage.getItem('spotflow_webhook_url') || '').trim();
+      } catch {
+        // Ignore storage error
+      }
+      if (!data.webhookUrl?.trim() && savedWebhook) {
+        data.webhookUrl = savedWebhook;
+        void apiFetch('/api/integration/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ webhookUrl: savedWebhook }),
+        }).catch(() => {});
+      } else if (data.webhookUrl?.trim()) {
+        try {
+          localStorage.setItem('spotflow_webhook_url', data.webhookUrl.trim());
+        } catch {
+          // Ignore storage error
+        }
+      }
       setIntegrationConfig(data);
     } catch {
       // Ignore
     }
   }, []);
+
+  const handleQuickSaveWebhookUrl = useCallback(
+    async (url: string): Promise<boolean> => {
+      const trimmed = url.trim();
+      if (!trimmed) return false;
+      try {
+        localStorage.setItem('spotflow_webhook_url', trimmed);
+      } catch {
+        // Ignore
+      }
+      setIntegrationConfig((prev) => ({ ...prev, webhookUrl: trimmed }));
+      try {
+        const res = await apiFetch('/api/integration/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ webhookUrl: trimmed }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as IntegrationConfig;
+          setIntegrationConfig(data);
+          return true;
+        }
+      } catch {
+        // State & localStorage still updated
+      }
+      return true;
+    },
+    []
+  );
 
   const syncUploadHistory = useCallback(async () => {
     try {
@@ -448,6 +497,7 @@ export default function App() {
             onStatsChange={setStats}
             onJobsUpdated={handleJobsUpdated}
             onSyncHistory={syncUploadHistory}
+            onQuickSaveWebhookUrl={handleQuickSaveWebhookUrl}
           />
         </main>
 

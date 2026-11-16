@@ -13,7 +13,9 @@ import {
   DeleteObjectCommand,
   DeleteObjectsCommand,
   GetBucketCorsCommand,
+  GetObjectCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   PutBucketCorsCommand,
   PutObjectCommand,
@@ -3017,17 +3019,32 @@ async function runCloudRepairNoLocal() {
       const cleanAlbum = target.album && target.album !== 'Kho nhạc Cloudflare R2' ? target.album : '';
       const safeDurSec = target.duration && target.duration !== 60 && target.duration !== 210 ? target.duration : undefined;
 
-      // Fast path: Check first 64KB of R2 MP3 via Range request to see if USLT lyrics & album are already embedded!
-      if (target.audioUrl && isRealCoverUrl(target.coverUrl)) {
+      // Fast path: Check first 64KB of R2 MP3 (and full ID3 tag up to 2MB if APIC precedes USLT)
+      if (target.audioUrl) {
         const rangeRes = await fetchWithRetry(
           target.audioUrl,
           { headers: { Range: 'bytes=0-65535' } },
           { timeoutMs: 8000, retries: 1 }
         ).catch(() => null);
         if (rangeRes && (rangeRes.status === 206 || rangeRes.ok)) {
-          const headBuf = Buffer.from(await rangeRes.arrayBuffer());
-          const quickTag = extractId3v2Fallback(headBuf, false);
-          if (quickTag.lyrics && quickTag.lyrics.length > 15) {
+          let headBuf = Buffer.from(await rangeRes.arrayBuffer());
+          let quickTag = extractId3v2Fallback(headBuf, false);
+          if (!quickTag.lyrics && headBuf.length >= 10 && headBuf[0] === 0x49 && headBuf[1] === 0x44 && headBuf[2] === 0x33) {
+            const tagSize = ((headBuf[6] & 0x7f) << 21) | ((headBuf[7] & 0x7f) << 14) | ((headBuf[8] & 0x7f) << 7) | (headBuf[9] & 0x7f);
+            const fullTagEnd = Math.min(2097152, 10 + tagSize);
+            if (fullTagEnd > headBuf.length) {
+              const tailRes = await fetchWithRetry(
+                target.audioUrl,
+                { headers: { Range: 'bytes=' + headBuf.length + '-' + (fullTagEnd - 1) } },
+                { timeoutMs: 12000, retries: 1 }
+              ).catch(() => null);
+              if (tailRes && (tailRes.status === 206 || tailRes.ok)) {
+                headBuf = Buffer.concat([headBuf, Buffer.from(await tailRes.arrayBuffer())]);
+                quickTag = extractId3v2Fallback(headBuf, false);
+              }
+            }
+          }
+          if (quickTag.lyrics && quickTag.lyrics.length > 15 && isRealCoverUrl(target.coverUrl)) {
             const isLrc = /\\[\\d{1,2}:\\d{2}/.test(quickTag.lyrics);
             const fastSynced = isLrc ? quickTag.lyrics : null;
             const fastPlain = isLrc
@@ -3809,6 +3826,18 @@ run().catch((err) => {
         r2TotalCount = r2Objects.length;
       }
 
+      // Prioritize R2 library tracks (`r2-...`) first because ~97% have embedded USLT in ID3,
+      // pushing `uploaded-*` / `spotflow-local_*` remix uploads and orphan R2 keys after them
+      // so Batch 1..N immediately backfill lyrics instead of stalling on external APIs.
+      const getCloudTrackPriority = (item: (typeof missingTracks)[number]): number => {
+        if (item.isOrphanR2) return 3;
+        const idLower = String(item.id || '').toLowerCase();
+        if (idLower.startsWith('r2-')) return item.missingLyrics ? 0 : 1;
+        if (idLower.startsWith('uploaded-')) return 2;
+        return item.missingLyrics ? 1 : 2;
+      };
+      missingTracks.sort((a, b) => getCloudTrackPriority(a) - getCloudTrackPriority(b));
+
       res.json({
         ok: true,
         appOrigin,
@@ -3835,7 +3864,8 @@ run().catch((err) => {
     t: CloudMissingTrackPayload,
     effectiveWebhook: string,
     reqHost: string,
-    reqProtocol: string
+    reqProtocol: string,
+    focusMode: 'all' | 'lyrics' | 'cover' | 'orphan' = 'all'
   ) => {
     let title = String(t.title || 'Unknown Track').trim();
     let artist = String(t.artist === 'Nghệ sĩ R2' ? '' : t.artist || '').trim();
@@ -3858,20 +3888,69 @@ run().catch((err) => {
     };
 
     let existingRealCover = isRealCover(t.coverUrl) ? String(t.coverUrl).trim() : null;
+    let derivedExistingCoverKey = t.r2CoverKey || null;
+    if (!derivedExistingCoverKey && existingRealCover && r2PublicBase && existingRealCover.startsWith(`${r2PublicBase}/`)) {
+      derivedExistingCoverKey = decodeURIComponent(existingRealCover.slice(r2PublicBase.length + 1));
+    }
+
     let r2EmbeddedSynced: string | null = null;
     let r2EmbeddedPlain: string | null = null;
     let fromR2Id3 = false;
 
-    // Step 1: Ultra-fast 64KB Range read from R2 CDN (~20ms) to extract already-embedded USLT lyrics & TALB album!
-    if (resolvedAudioUrl && (t.isOrphanR2 || t.missingLyrics || !album)) {
-      try {
+    const readR2Range = async (startByte: number, endByte: number): Promise<Buffer | null> => {
+      if (t.r2AudioKey && r2.enabled && validateR2Config(r2) === null) {
+        const client = getR2Client(r2);
+        const s3Obj = await client.send(
+          new GetObjectCommand({
+            Bucket: r2.bucketName,
+            Key: t.r2AudioKey,
+            Range: `bytes=${startByte}-${endByte}`,
+          })
+        );
+        if (s3Obj.Body) {
+          const bytes = await s3Obj.Body.transformToByteArray();
+          return Buffer.from(bytes);
+        }
+      } else if (resolvedAudioUrl) {
         const rangeRes = await fetch(resolvedAudioUrl, {
-          headers: { Range: 'bytes=0-65535' },
+          headers: { Range: `bytes=${startByte}-${endByte}` },
           signal: AbortSignal.timeout(6000),
         });
         if (rangeRes.ok || rangeRes.status === 206) {
-          const headBuf = Buffer.from(await rangeRes.arrayBuffer());
-          const hdr = parseQuickId3MetaServer(headBuf);
+          return Buffer.from(await rangeRes.arrayBuffer());
+        }
+      }
+      return null;
+    };
+
+    // Step 1: Ultra-fast 64KB Range read via S3 API (no .r2.dev 429 rate limits!)
+    // + automatic extension up to 2MB if APIC cover art precedes USLT inside the ID3v2 tag
+    if ((t.isOrphanR2 || t.missingLyrics || !album) && (t.r2AudioKey || resolvedAudioUrl)) {
+      try {
+        let headBuf = await readR2Range(0, 65535);
+        if (headBuf && headBuf.length > 10) {
+          let hdr = parseQuickId3MetaServer(headBuf);
+          if (
+            !hdr.syncedLyrics &&
+            !hdr.plainLyrics &&
+            headBuf[0] === 0x49 &&
+            headBuf[1] === 0x44 &&
+            headBuf[2] === 0x33
+          ) {
+            const tagSize =
+              ((headBuf[6] & 0x7f) << 21) |
+              ((headBuf[7] & 0x7f) << 14) |
+              ((headBuf[8] & 0x7f) << 7) |
+              (headBuf[9] & 0x7f);
+            const fullTagEnd = Math.min(2 * 1024 * 1024, 10 + tagSize);
+            if (fullTagEnd > headBuf.length) {
+              const tailBuf = await readR2Range(headBuf.length, fullTagEnd - 1);
+              if (tailBuf && tailBuf.length > 0) {
+                headBuf = Buffer.concat([headBuf, tailBuf]);
+                hdr = parseQuickId3MetaServer(headBuf);
+              }
+            }
+          }
           if (t.isOrphanR2 && hdr.title) title = hdr.title;
           if ((t.isOrphanR2 || !artist) && hdr.artist) artist = hdr.artist;
           if (hdr.album && !album) album = hdr.album;
@@ -3886,25 +3965,30 @@ run().catch((err) => {
       }
     }
 
-    // Step 2: If cover is missing on App, check if .bat already uploaded covers/<audioStem>.jpg on R2
+    // Step 2: If cover is missing on App, check via S3 HeadObject if .bat already uploaded covers/<audioStem>.jpg on R2
     if (!existingRealCover && t.r2AudioKey && r2PublicBase) {
       const exactStem = t.r2AudioKey.replace(/^tracks\//i, '').replace(/\.mp3$/i, '');
-      const candidateCoverUrl = `${r2PublicBase}/covers/${exactStem}.jpg`;
-      try {
-        const headCover = await fetch(candidateCoverUrl, {
-          method: 'HEAD',
-          signal: AbortSignal.timeout(3500),
-        });
-        if (headCover.ok) {
-          existingRealCover = candidateCoverUrl;
+      const candidateCoverKey = `covers/${exactStem}.jpg`;
+      if (r2.enabled && validateR2Config(r2) === null) {
+        try {
+          const client = getR2Client(r2);
+          await client.send(
+            new HeadObjectCommand({
+              Bucket: r2.bucketName,
+              Key: candidateCoverKey,
+            })
+          );
+          existingRealCover = `${r2PublicBase}/${candidateCoverKey}`;
+          derivedExistingCoverKey = candidateCoverKey;
+        } catch {
+          // Cover does not exist on R2
         }
-      } catch {
-        // Ignore
       }
     }
 
     const stillNeedLyrics = Boolean(t.missingLyrics && !r2EmbeddedSynced && !r2EmbeddedPlain);
-    const stillNeedCover = !existingRealCover;
+    // When running in Lyrics-only mode and USLT is already extracted from R2, skip slow external iTunes calls
+    const stillNeedCover = focusMode === 'lyrics' && (r2EmbeddedSynced || r2EmbeddedPlain) ? false : !existingRealCover;
 
     const safeDurSec =
       t.duration && t.duration > 30 && t.duration !== 60 && t.duration !== 210
@@ -4016,7 +4100,7 @@ run().catch((err) => {
       plainLyrics,
       r2AudioKey: t.r2AudioKey || null,
       r2AudioUrl: resolvedAudioUrl || null,
-      r2CoverKey: newR2CoverKey || t.r2CoverKey || null,
+      r2CoverKey: newR2CoverKey || derivedExistingCoverKey || null,
       r2CoverUrl: finalCoverUrl,
       storageProvider: resolvedAudioUrl ? 'r2' : 'spotflow',
     };
@@ -4027,6 +4111,7 @@ run().catch((err) => {
       id: String(t.id || ''),
       r2AudioKey: String(t.r2AudioKey || ''),
       status: (pushOutcome.success ? 'updated' : 'webhook_error') as 'updated' | 'webhook_error',
+      httpStatus: pushOutcome.status,
       message: pushOutcome.message,
       title: finalTitle,
       artist: finalArtist,
@@ -4043,6 +4128,7 @@ run().catch((err) => {
       const body = (req.body || {}) as {
         track?: CloudMissingTrackPayload;
         webhookUrl?: string;
+        focusMode?: 'all' | 'lyrics' | 'cover' | 'orphan';
       };
       const t = body.track;
       if (!t || (!t.title && !t.r2AudioKey)) {
@@ -4056,7 +4142,13 @@ run().catch((err) => {
       }
       const reqHost = req.get('host') || 'localhost:3000';
       const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
-      const outcome = await backfillSingleCloudTrack(t, effectiveWebhook, reqHost, reqProtocol);
+      const outcome = await backfillSingleCloudTrack(
+        t,
+        effectiveWebhook,
+        reqHost,
+        reqProtocol,
+        body.focusMode || 'all'
+      );
       res.json(outcome);
     } catch (err) {
       res.status(500).json({
@@ -4071,6 +4163,7 @@ run().catch((err) => {
         tracks?: CloudMissingTrackPayload[];
         webhookUrl?: string;
         concurrency?: number;
+        focusMode?: 'all' | 'lyrics' | 'cover' | 'orphan';
       };
       const tracks = Array.isArray(body.tracks) ? body.tracks.slice(0, 30) : [];
       if (tracks.length === 0) {
@@ -4085,6 +4178,7 @@ run().catch((err) => {
 
       const reqHost = req.get('host') || 'localhost:3000';
       const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+      const focusMode = body.focusMode || 'all';
       const workerCount = Math.min(Math.max(Number(body.concurrency) || 6, 2), 8, tracks.length);
       const results = new Array<Awaited<ReturnType<typeof backfillSingleCloudTrack>>>(tracks.length);
       let cursor = 0;
@@ -4096,12 +4190,19 @@ run().catch((err) => {
             if (idx >= tracks.length) break;
             const item = tracks[idx];
             try {
-              results[idx] = await backfillSingleCloudTrack(item, effectiveWebhook, reqHost, reqProtocol);
+              results[idx] = await backfillSingleCloudTrack(
+                item,
+                effectiveWebhook,
+                reqHost,
+                reqProtocol,
+                focusMode
+              );
             } catch (err) {
               results[idx] = {
                 id: String(item.id || ''),
                 r2AudioKey: String(item.r2AudioKey || ''),
                 status: 'webhook_error',
+                httpStatus: 500,
                 message: err instanceof Error ? err.message : 'Lỗi xử lý bài hát',
                 title: String(item.title || ''),
                 artist: String(item.artist || ''),
@@ -4262,6 +4363,231 @@ run().catch((err) => {
     } catch (err) {
       res.status(500).json({
         error: err instanceof Error ? err.message : 'Lỗi dọn file MP3 trùng dư trên R2.',
+      });
+    }
+  });
+
+  app.post('/api/cloud/check-playable', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {
+        appUrl?: string;
+        webhookUrl?: string;
+        verifyHeaders?: boolean;
+      };
+      const r2 = integrationSettings.r2;
+      const canScanR2 = r2.enabled && validateR2Config(r2) === null;
+      const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
+
+      const listR2SizeMap = async (): Promise<Map<string, number> | null> => {
+        if (!canScanR2) return null;
+        const client = getR2Client(r2);
+        const sizeMap = new Map<string, number>();
+        let token: string | undefined;
+        let pages = 0;
+        while (pages < 40) {
+          pages++;
+          const out = await client.send(
+            new ListObjectsV2Command({
+              Bucket: r2.bucketName,
+              Prefix: 'tracks/',
+              MaxKeys: 1000,
+              ContinuationToken: token,
+            })
+          );
+          for (const obj of out.Contents || []) {
+            if (obj.Key) sizeMap.set(obj.Key, obj.Size || 0);
+          }
+          if (!out.IsTruncated || !out.NextContinuationToken) break;
+          token = out.NextContinuationToken;
+        }
+        return sizeMap;
+      };
+
+      const [{ appOrigin, appTracks, appLoaded, lastAppError }, r2SizeMap] = await Promise.all([
+        fetchSoundlyAppTracks(body.appUrl || effectiveWebhook),
+        listR2SizeMap(),
+      ]);
+
+      if (!appLoaded) {
+        res.status(502).json({
+          error: `Không thể tải danh sách bài từ App (${lastAppError || 'Không phản hồi'}).`,
+        });
+        return;
+      }
+
+      const brokenTracks: Array<{
+        id: string;
+        title: string;
+        artist: string;
+        audioUrl: string;
+        r2AudioKey: string;
+        reason: string;
+        sizeBytes: number | null;
+      }> = [];
+
+      const verifyList: Array<{ track: SoundlyAppTrackItem; key: string; sizeBytes: number | null }> = [];
+      let playableCount = 0;
+
+      for (const t of appTracks) {
+        const url = String(t.audioUrl || '').trim();
+        const key = String(t.r2AudioKey || '').trim();
+        let derivedKey = key;
+        if (!derivedKey && url) {
+          try {
+            derivedKey = decodeURIComponent(new URL(url).pathname.replace(/^\/+/, ''));
+          } catch {
+            derivedKey = '';
+          }
+        }
+
+        if (!url || !/^https?:\/\//i.test(url)) {
+          brokenTracks.push({
+            id: String(t.id || ''),
+            title: String(t.title || 'Unknown'),
+            artist: String(t.artist || ''),
+            audioUrl: url,
+            r2AudioKey: key,
+            reason: 'Thiếu hoặc sai định dạng audioUrl',
+            sizeBytes: null,
+          });
+          continue;
+        }
+
+        if (r2SizeMap) {
+          if (!derivedKey || !r2SizeMap.has(derivedKey)) {
+            verifyList.push({ track: t, key: derivedKey, sizeBytes: null });
+            continue;
+          }
+          const sz = r2SizeMap.get(derivedKey) ?? 0;
+          if (sz < 25000) {
+            brokenTracks.push({
+              id: String(t.id || ''),
+              title: String(t.title || 'Unknown'),
+              artist: String(t.artist || ''),
+              audioUrl: url,
+              r2AudioKey: derivedKey,
+              reason: `File R2 quá nhỏ / bị cắt (${sz} bytes)`,
+              sizeBytes: sz,
+            });
+            continue;
+          }
+          if (key && url.includes('.r2.dev/')) {
+            try {
+              const urlPathKey = decodeURIComponent(new URL(url).pathname.replace(/^\/+/, ''));
+              if (urlPathKey !== key) {
+                verifyList.push({ track: t, key: urlPathKey, sizeBytes: sz });
+                continue;
+              }
+            } catch {
+              // Ignore malformed URL
+            }
+          }
+          if (body.verifyHeaders) {
+            verifyList.push({ track: t, key: derivedKey, sizeBytes: sz });
+          } else {
+            playableCount++;
+          }
+        } else {
+          verifyList.push({ track: t, key: derivedKey, sizeBytes: null });
+        }
+      }
+
+      const isValidAudioMagic = (buf: Buffer): boolean => {
+        if (!buf || buf.length < 4) return false;
+        if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return true; // ID3
+        for (let i = 0; i < Math.min(buf.length - 1, 2048); i++) {
+          if (buf[i] === 0xff && (buf[i + 1] & 0xe0) === 0xe0) return true; // MP3 frame sync
+        }
+        const h4 = buf.subarray(0, 4).toString('ascii');
+        if (h4 === 'OggS' || h4 === 'RIFF' || h4 === 'fLaC') return true;
+        if (buf.length >= 8 && buf.subarray(4, 8).toString('ascii') === 'ftyp') return true;
+        return false;
+      };
+
+      if (verifyList.length > 0) {
+        const client = canScanR2 ? getR2Client(r2) : null;
+        let cursor = 0;
+        const workerCount = Math.min(24, verifyList.length);
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            while (true) {
+              const idx = cursor++;
+              if (idx >= verifyList.length) break;
+              const item = verifyList[idx];
+              const t = item.track;
+              const url = String(t.audioUrl || '').trim();
+              let ok = false;
+              let reason = 'Không đọc được dữ liệu âm thanh';
+
+              try {
+                if (client && item.key && r2SizeMap?.has(item.key)) {
+                  const s3Obj = await client.send(
+                    new GetObjectCommand({
+                      Bucket: r2.bucketName,
+                      Key: item.key,
+                      Range: 'bytes=0-4095',
+                    })
+                  );
+                  const raw = s3Obj.Body ? Buffer.from(await s3Obj.Body.transformToByteArray()) : Buffer.alloc(0);
+                  if (isValidAudioMagic(raw)) {
+                    ok = true;
+                  } else {
+                    reason = `Sai header âm thanh (${raw.subarray(0, 16).toString('hex')})`;
+                  }
+                } else {
+                  const probeRes = await fetch(url, {
+                    headers: { Range: 'bytes=0-4095' },
+                    signal: AbortSignal.timeout(10000),
+                  });
+                  if (probeRes.ok || probeRes.status === 206) {
+                    const ct = (probeRes.headers.get('content-type') || '').toLowerCase();
+                    if (ct.includes('text/html') || ct.includes('application/xml')) {
+                      reason = `URL trả về ${ct} thay vì file nhạc`;
+                    } else {
+                      const raw = Buffer.from(await probeRes.arrayBuffer());
+                      if (isValidAudioMagic(raw)) {
+                        ok = true;
+                      } else {
+                        reason = `File không phải định dạng audio hợp lệ (${raw.length} bytes)`;
+                      }
+                    }
+                  } else {
+                    reason = `HTTP ${probeRes.status}`;
+                  }
+                }
+              } catch (err) {
+                reason = err instanceof Error ? err.message : 'Lỗi kết nối file nhạc';
+              }
+
+              if (ok) {
+                playableCount++;
+              } else {
+                brokenTracks.push({
+                  id: String(t.id || ''),
+                  title: String(t.title || 'Unknown'),
+                  artist: String(t.artist || ''),
+                  audioUrl: url,
+                  r2AudioKey: item.key,
+                  reason,
+                  sizeBytes: item.sizeBytes,
+                });
+              }
+            }
+          })
+        );
+      }
+
+      res.json({
+        ok: true,
+        appOrigin,
+        totalAppTracks: appTracks.length,
+        playableCount,
+        brokenCount: brokenTracks.length,
+        brokenTracks,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Lỗi kiểm tra file nhạc trên App.',
       });
     }
   });

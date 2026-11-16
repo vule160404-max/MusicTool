@@ -161,6 +161,15 @@ export function IntegrationModal({
       });
       if (!res.ok) throw new Error('Không thể lưu cài đặt.');
       const data = (await res.json()) as IntegrationConfig;
+      try {
+        if (data.webhookUrl?.trim()) {
+          localStorage.setItem('spotflow_webhook_url', data.webhookUrl.trim());
+        } else {
+          localStorage.removeItem('spotflow_webhook_url');
+        }
+      } catch {
+        // Ignore
+      }
       setConfig(data);
       setR2SecretInput('');
       onSettingsSaved?.(data);
@@ -622,14 +631,28 @@ export function IntegrationModal({
               </p>
 
               <div className="space-y-2">
-                <label htmlFor="webhook-url-input" className="block text-xs text-slate-400">Webhook Receiver URL của bạn</label>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label htmlFor="webhook-url-input" className="block text-xs text-slate-400">Webhook Receiver URL của bạn</label>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setConfig((prev) => ({
+                        ...prev,
+                        webhookUrl: 'https://soundly-psi.vercel.app/api/webhooks/spotflow',
+                      }))
+                    }
+                    className="text-[11px] text-[#1DB954] hover:underline cursor-pointer"
+                  >
+                    Điền nhanh Soundly Webhook
+                  </button>
+                </div>
                 <div className="flex items-center gap-2">
                   <input
                     id="webhook-url-input"
                     type="url"
                     value={config.webhookUrl}
                     onChange={(e) => setConfig({ ...config, webhookUrl: e.target.value })}
-                    placeholder="https://app-nhac-cua-ban.com/api/webhooks/spotflow"
+                    placeholder="https://soundly-psi.vercel.app/api/webhooks/spotflow"
                     className="w-full h-9 rounded bg-[#141920] border border-white/[0.1] px-3 font-mono text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-[#1DB954]"
                   />
                   <button

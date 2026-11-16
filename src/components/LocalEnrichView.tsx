@@ -152,6 +152,7 @@ interface LocalEnrichViewProps {
   onStatsChange: (stats: { totalEntries: number; doneCount: number; totalSizeMb: string }) => void;
   onJobsUpdated: (jobs: DownloadJob[]) => void;
   onSyncHistory: () => Promise<void>;
+  onQuickSaveWebhookUrl?: (url: string) => Promise<boolean>;
 }
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -206,6 +207,7 @@ export function LocalEnrichView({
   onStatsChange,
   onJobsUpdated,
   onSyncHistory,
+  onQuickSaveWebhookUrl,
 }: LocalEnrichViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
@@ -255,9 +257,24 @@ export function LocalEnrichView({
   const [isScanningCloud, setIsScanningCloud] = useState<boolean>(false);
   const [isRunningCloudBackfill, setIsRunningCloudBackfill] = useState<boolean>(false);
   const [isCleaningR2Duplicates, setIsCleaningR2Duplicates] = useState<boolean>(false);
+  const [isCheckingPlayable, setIsCheckingPlayable] = useState<boolean>(false);
   const [cloudFilterMode, setCloudFilterMode] = useState<CloudFilterMode>('all');
   const [cloudScanInfo, setCloudScanInfo] = useState<CloudScanSummary | null>(null);
   const [cloudProgress, setCloudProgress] = useState<CloudBackfillProgress | null>(null);
+  const [playableReport, setPlayableReport] = useState<{
+    totalAppTracks: number;
+    playableCount: number;
+    brokenCount: number;
+    brokenTracks: Array<{
+      id: string;
+      title: string;
+      artist: string;
+      audioUrl: string;
+      r2AudioKey: string;
+      reason: string;
+      sizeBytes: number | null;
+    }>;
+  } | null>(null);
 
   const folderInputId = useId();
   const multiFileFolderInputId = useId();
@@ -2111,6 +2128,55 @@ export function LocalEnrichView({
     }
   };
 
+  const handleCheckPlayableTracks = async () => {
+    if (isCheckingPlayable || isScanningCloud || isRunningCloudBackfill || isCleaningR2Duplicates) return;
+    setIsCheckingPlayable(true);
+    try {
+      const res = await apiFetch('/api/cloud/check-playable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          webhookUrl: webhookUrl.trim(),
+          verifyHeaders: false,
+        }),
+      });
+      const data = await readJsonResponse<{
+        ok?: boolean;
+        totalAppTracks: number;
+        playableCount: number;
+        brokenCount: number;
+        brokenTracks: Array<{
+          id: string;
+          title: string;
+          artist: string;
+          audioUrl: string;
+          r2AudioKey: string;
+          reason: string;
+          sizeBytes: number | null;
+        }>;
+        error?: string;
+      }>(res);
+      if (!res.ok) {
+        throw new Error(data.error || `Lỗi kiểm tra file lỗi (${res.status}).`);
+      }
+      setPlayableReport({
+        totalAppTracks: data.totalAppTracks,
+        playableCount: data.playableCount,
+        brokenCount: data.brokenCount,
+        brokenTracks: data.brokenTracks || [],
+      });
+      if (data.brokenCount === 0) {
+        showToast(`Toàn bộ ${data.totalAppTracks} bài trên App đều có file nhạc hợp lệ trên R2, phát bình thường!`);
+      } else {
+        showToast(`Phát hiện ${data.brokenCount}/${data.totalAppTracks} bài có file nhạc lỗi không phát được.`);
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Không thể kiểm tra file nhạc trên App.');
+    } finally {
+      setIsCheckingPlayable(false);
+    }
+  };
+
   const handleStopCloudBackfill = () => {
     stopCloudBackfillRef.current = true;
     showToast('Đang dừng quét bù Cloud sau lô hiện tại (bấm Chạy tiếp sẽ tiếp tục từ bài kế tiếp)...');
@@ -2165,9 +2231,10 @@ export function LocalEnrichView({
       logs = [line, ...logs].slice(0, 30);
     };
 
-    const BATCH_SIZE = 20;
+    const BATCH_SIZE = 10;
     let batchCursor = 0;
-    // Run 2 concurrent batch requests (each batch handles 20 tracks with 6 server workers => ~12 parallel tracks without browser or Render bottleneck)
+    let authErrorAlerted = false;
+    // Run 2 concurrent batch requests (each batch handles 10 tracks with 6 server workers => ~9s worst case, avoiding Render 30s timeout)
     const batchRunners = Math.min(2, Math.ceil(targets.length / BATCH_SIZE));
 
     try {
@@ -2187,6 +2254,7 @@ export function LocalEnrichView({
                   tracks: chunk,
                   webhookUrl: webhookUrl.trim(),
                   concurrency: 6,
+                  focusMode: cloudFilterMode,
                 }),
               });
               const data = await readJsonResponse<{
@@ -2195,6 +2263,7 @@ export function LocalEnrichView({
                   id?: string;
                   r2AudioKey?: string;
                   status?: 'updated' | 'no_source' | 'webhook_error';
+                  httpStatus?: number;
                   message?: string;
                   title?: string;
                   artist?: string;
@@ -2236,6 +2305,13 @@ export function LocalEnrichView({
                   } else {
                     errors++;
                     pushLog(`[Lỗi Webhook] ${label}: ${r.message || 'Thất bại'}`);
+                    if ((r.httpStatus === 401 || r.httpStatus === 403) && !authErrorAlerted) {
+                      authErrorAlerted = true;
+                      stopCloudBackfillRef.current = true;
+                      pushLog(
+                        `[DỪNG KHẨN CẤP - Lỗi API Key HTTP ${r.httpStatus}]: X-API-Key SpotFlow không khớp với Soundly. Mở "Liên kết App Nhạc & R2" để dán đúng API Key!`
+                      );
+                    }
                   }
                 }
 
@@ -2280,7 +2356,11 @@ export function LocalEnrichView({
         })
       );
 
-      if (stopCloudBackfillRef.current) {
+      if (authErrorAlerted) {
+        showToast(
+          'Soundly từ chối Webhook (HTTP 401/403 - sai X-API-Key). Hãy mở "Liên kết App Nhạc & R2" để dán API Key khớp với Soundly!'
+        );
+      } else if (stopCloudBackfillRef.current) {
         showToast(
           `Đã tạm dừng quét bù Cloud (${done}/${targets.length} bài · Đã bù ${updated} bài, đọc sẵn từ R2: ${fromR2Id3}). Bấm tiếp để chạy phần còn lại!`
         );
@@ -2656,7 +2736,7 @@ export function LocalEnrichView({
                   <button
                     type="button"
                     onClick={() => void handleScanCloudMissing()}
-                    disabled={isScanningCloud || isRunningCloudBackfill || isCleaningR2Duplicates}
+                    disabled={isScanningCloud || isRunningCloudBackfill || isCleaningR2Duplicates || isCheckingPlayable}
                     className="h-8 px-2.5 rounded border border-white/[0.14] bg-white/[0.06] hover:bg-white/[0.12] disabled:opacity-45 text-xs text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     {isScanningCloud ? (
@@ -2665,6 +2745,21 @@ export function LocalEnrichView({
                       <Search className="h-3.5 w-3.5 text-cyan-400" />
                     )}
                     <span>{isScanningCloud ? 'Đang quét...' : 'Quét lại App & R2'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleCheckPlayableTracks()}
+                    disabled={isCheckingPlayable || isScanningCloud || isRunningCloudBackfill || isCleaningR2Duplicates}
+                    title="Đối chiếu toàn bộ bài hát trên App với file thực tế trên R2 để tìm bài bị mất file, 0 byte hoặc link hỏng"
+                    className="h-8 px-2.5 rounded border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-45 text-xs font-medium text-emerald-200 inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {isCheckingPlayable ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-300" />
+                    ) : (
+                      <FileAudio className="h-3.5 w-3.5 text-emerald-300" />
+                    )}
+                    <span>{isCheckingPlayable ? 'Đang kiểm tra...' : 'Kiểm tra file lỗi'}</span>
                   </button>
 
                   {cloudScanInfo && (cloudScanInfo.duplicateR2Count || 0) > 0 && (
@@ -2737,6 +2832,39 @@ export function LocalEnrichView({
                   )}
                 </div>
               </div>
+
+              {!webhookUrl.trim() && (
+                <div className="rounded border border-amber-500/35 bg-amber-500/10 px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-200">
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <AlertCircle className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                    <span>
+                      Chưa có Webhook URL App Nhạc (thường bị xóa khi server khởi động lại) nên chưa thể ghi lyrics về App.
+                    </span>
+                  </span>
+                  <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                    {onQuickSaveWebhookUrl && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await onQuickSaveWebhookUrl('https://soundly-psi.vercel.app/api/webhooks/spotflow');
+                          setCloudScanInfo((prev) => (prev ? { ...prev, webhookConfigured: true } : prev));
+                          showToast('Đã lưu Soundly Webhook URL! Bạn có thể bấm "Chạy bù Không nghẽn" ngay.');
+                        }}
+                        className="px-2.5 py-1 rounded bg-amber-400 hover:bg-amber-300 text-[#090B0E] font-semibold cursor-pointer"
+                      >
+                        Điền &amp; Lưu Soundly Webhook
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={onOpenIntegrationModal}
+                      className="px-2.5 py-1 rounded border border-amber-400/40 bg-white/[0.06] hover:bg-white/[0.12] text-amber-100 cursor-pointer"
+                    >
+                      Kiểm tra Key &amp; Webhook
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {cloudScanInfo && (
                 <div className="space-y-2 pt-2 border-t border-white/[0.08]">
@@ -2874,6 +3002,34 @@ export function LocalEnrichView({
                       {cloudProgress.recentLogs.map((line, i) => (
                         <div key={i} className="truncate">
                           {line}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {playableReport && (
+                <div className="space-y-1.5 pt-2 border-t border-white/[0.08] font-mono text-[11px]">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className={playableReport.brokenCount === 0 ? 'text-emerald-300' : 'text-rose-300'}>
+                      {playableReport.brokenCount === 0
+                        ? `Kiểm tra file nhạc: ${playableReport.playableCount}/${playableReport.totalAppTracks} bài hợp lệ 100%, không có file lỗi.`
+                        : `Kiểm tra file nhạc: Phát được ${playableReport.playableCount}/${playableReport.totalAppTracks} · Lỗi ${playableReport.brokenCount} bài`}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setPlayableReport(null)}
+                      className="text-slate-400 hover:text-white cursor-pointer"
+                    >
+                      Ẩn
+                    </button>
+                  </div>
+                  {playableReport.brokenTracks.length > 0 && (
+                    <div className="max-h-28 overflow-y-auto rounded bg-[#07090C] border border-rose-500/25 px-2.5 py-1.5 space-y-0.5 text-rose-200">
+                      {playableReport.brokenTracks.map((bt, idx) => (
+                        <div key={`${bt.id}_${idx}`} className="truncate">
+                          [{bt.reason}] {bt.artist ? `${bt.artist} - ` : ''}{bt.title} ({bt.r2AudioKey || bt.audioUrl})
                         </div>
                       ))}
                     </div>
