@@ -119,9 +119,13 @@ export function loadLocalUploadHistory(): UploadHistoryItem[] {
 
 export function saveLocalUploadHistory(items: UploadHistoryItem[]): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(items.slice(0, 2000)));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(items.slice(0, 6000)));
   } catch {
-    // Ignore storage quota errors
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(items.slice(0, 2000)));
+    } catch {
+      // Ignore storage quota errors
+    }
   }
 }
 
@@ -155,5 +159,5 @@ export function mergeUploadHistories(
 
   return Array.from(byKey.values())
     .sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime())
-    .slice(0, 2000);
+    .slice(0, 50000);
 }

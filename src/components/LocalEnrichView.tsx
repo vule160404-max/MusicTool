@@ -109,16 +109,24 @@ interface CloudScanSummary {
   r2TotalCount: number | null;
   missingLyricsCount: number;
   missingCoverCount: number;
+  genericAlbumCount?: number;
   orphanR2Count: number;
+  duplicateR2Count?: number;
+  duplicateR2Keys?: string[];
+  historyTotal?: number;
   tracks: CloudMissingTrack[];
 }
+
+type CloudFilterMode = 'all' | 'lyrics' | 'cover' | 'orphan';
 
 interface CloudBackfillProgress {
   done: number;
   total: number;
   updated: number;
+  fromR2Id3: number;
   noSource: number;
   errors: number;
+  rateLabel: string;
   recentLogs: string[];
 }
 
@@ -246,6 +254,8 @@ export function LocalEnrichView({
   const [cloudPanelOpen, setCloudPanelOpen] = useState<boolean>(false);
   const [isScanningCloud, setIsScanningCloud] = useState<boolean>(false);
   const [isRunningCloudBackfill, setIsRunningCloudBackfill] = useState<boolean>(false);
+  const [isCleaningR2Duplicates, setIsCleaningR2Duplicates] = useState<boolean>(false);
+  const [cloudFilterMode, setCloudFilterMode] = useState<CloudFilterMode>('all');
   const [cloudScanInfo, setCloudScanInfo] = useState<CloudScanSummary | null>(null);
   const [cloudProgress, setCloudProgress] = useState<CloudBackfillProgress | null>(null);
 
@@ -2000,8 +2010,18 @@ export function LocalEnrichView({
       !pickedFolderName &&
       (/^[a-zA-Z]:[\\/]/.test(trimmedPathPreview) || /^\\\\/.test(trimmedPathPreview))
   );
+  const filteredCloudTargets = useMemo(() => {
+    if (!cloudScanInfo) return [];
+    return cloudScanInfo.tracks.filter((t) => {
+      if (cloudFilterMode === 'lyrics') return t.missingLyrics && !t.isOrphanR2;
+      if (cloudFilterMode === 'cover') return t.missingCover && !t.isOrphanR2;
+      if (cloudFilterMode === 'orphan') return Boolean(t.isOrphanR2);
+      return true;
+    });
+  }, [cloudScanInfo, cloudFilterMode]);
+
   const handleScanCloudMissing = async () => {
-    if (isScanningCloud || isRunningCloudBackfill) return;
+    if (isScanningCloud || isRunningCloudBackfill || isCleaningR2Duplicates) return;
     setCloudPanelOpen(true);
     setIsScanningCloud(true);
     try {
@@ -2019,8 +2039,13 @@ export function LocalEnrichView({
       }
       setCloudScanInfo(data);
       setCloudProgress(null);
+      void onSyncHistory().catch(() => {});
+      const dupNote =
+        data.duplicateR2Count && data.duplicateR2Count > 0
+          ? ` · Đã tách riêng ${data.duplicateR2Count} file R2 trùng dư`
+          : '';
       showToast(
-        `Đã quét App & R2: ${data.tracks.length} bài cần bù (thiếu lyrics: ${data.missingLyricsCount}, thiếu ảnh: ${data.missingCoverCount}${data.orphanR2Count > 0 ? `, chưa lên App: ${data.orphanR2Count}` : ''}).`
+        `Đã quét App (${data.totalAppTracks} bài) & R2: ${data.tracks.length} bài cần bù thật (thiếu lyrics: ${data.missingLyricsCount}, thiếu ảnh: ${data.missingCoverCount}${data.orphanR2Count > 0 ? `, R2 mới: ${data.orphanR2Count}` : ''})${dupNote}.`
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Không thể quét App & R2.';
@@ -2030,13 +2055,60 @@ export function LocalEnrichView({
     }
   };
 
+  const handleCleanupR2Duplicates = async () => {
+    if (isCleaningR2Duplicates || isRunningCloudBackfill || isScanningCloud) return;
+    const dupKeys = cloudScanInfo?.duplicateR2Keys || [];
+    if (dupKeys.length === 0) return;
+
+    setIsCleaningR2Duplicates(true);
+    let totalDeleted = 0;
+    const chunkSize = 250;
+    try {
+      for (let i = 0; i < dupKeys.length; i += chunkSize) {
+        const chunk = dupKeys.slice(i, i + chunkSize);
+        const res = await apiFetch('/api/cloud/cleanup-r2-duplicates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            keys: chunk,
+            webhookUrl: webhookUrl.trim(),
+          }),
+        });
+        const data = await readJsonResponse<{ ok?: boolean; deletedCount?: number; error?: string }>(res);
+        if (!res.ok) {
+          throw new Error(data.error || `Lỗi dọn R2 (${res.status}).`);
+        }
+        totalDeleted += data.deletedCount || 0;
+      }
+
+      setCloudScanInfo((prev) =>
+        prev
+          ? {
+              ...prev,
+              r2TotalCount:
+                prev.r2TotalCount !== null ? Math.max(0, prev.r2TotalCount - totalDeleted) : null,
+              duplicateR2Count: Math.max(0, (prev.duplicateR2Count || 0) - totalDeleted),
+              duplicateR2Keys: [],
+            }
+          : prev
+      );
+      showToast(
+        `Đã dọn sạch ${totalDeleted} file MP3 trùng dư trên Cloudflare R2 (giữ nguyên 100% các bài đang phát trên App)!`
+      );
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Không thể dọn file trùng dư trên R2.');
+    } finally {
+      setIsCleaningR2Duplicates(false);
+    }
+  };
+
   const handleStopCloudBackfill = () => {
     stopCloudBackfillRef.current = true;
-    showToast('Đang dừng quét bù Cloud sau các bài đang xử lý...');
+    showToast('Đang dừng quét bù Cloud sau lô hiện tại (bấm Chạy tiếp sẽ tiếp tục từ bài kế tiếp)...');
   };
 
   const handleStartCloudBackfill = async () => {
-    if (isRunningCloudBackfill || isScanningCloud) return;
+    if (isRunningCloudBackfill || isScanningCloud || isCleaningR2Duplicates) return;
     if (!cloudScanInfo || cloudScanInfo.tracks.length === 0) {
       await handleScanCloudMissing();
       return;
@@ -2047,93 +2119,166 @@ export function LocalEnrichView({
       return;
     }
 
-    const targets = cloudScanInfo.tracks;
+    const targets = filteredCloudTargets.length > 0 ? [...filteredCloudTargets] : [...cloudScanInfo.tracks];
+    if (targets.length === 0) {
+      showToast('Không có bài hát nào trong bộ lọc này cần xử lý.');
+      return;
+    }
+
     stopCloudBackfillRef.current = false;
     setIsRunningCloudBackfill(true);
 
+    const startedAt = Date.now();
     let done = 0;
     let updated = 0;
+    let fromR2Id3 = 0;
     let noSource = 0;
     let errors = 0;
     let logs: string[] = [];
-    let cursor = 0;
+
+    const formatSpeed = (count: number) => {
+      const sec = Math.max(0.5, (Date.now() - startedAt) / 1000);
+      return `${(count / sec).toFixed(1)} bài/giây`;
+    };
 
     setCloudProgress({
       done: 0,
       total: targets.length,
       updated: 0,
+      fromR2Id3: 0,
       noSource: 0,
       errors: 0,
+      rateLabel: '0.0 bài/giây',
       recentLogs: [],
     });
 
     const pushLog = (line: string) => {
-      logs = [line, ...logs].slice(0, 25);
+      logs = [line, ...logs].slice(0, 30);
     };
 
-    const workerCount = Math.min(Math.max(pushConcurrency || 4, 2), 6, targets.length);
+    const BATCH_SIZE = 20;
+    let batchCursor = 0;
+    // Run 2 concurrent batch requests (each batch handles 20 tracks with 6 server workers => ~12 parallel tracks without browser or Render bottleneck)
+    const batchRunners = Math.min(2, Math.ceil(targets.length / BATCH_SIZE));
+
     try {
       await Promise.all(
-        Array.from({ length: workerCount }, async () => {
+        Array.from({ length: batchRunners }, async () => {
           while (!stopCloudBackfillRef.current) {
-            const idx = cursor++;
-            if (idx >= targets.length) break;
-            const item = targets[idx];
-            const label = `${item.artist ? `${item.artist} - ` : ''}${item.title || item.r2AudioKey}`;
+            const startIdx = batchCursor * BATCH_SIZE;
+            batchCursor++;
+            if (startIdx >= targets.length) break;
+            const chunk = targets.slice(startIdx, startIdx + BATCH_SIZE);
+
             try {
-              const res = await apiFetch('/api/cloud/backfill-track', {
+              const res = await apiFetch('/api/cloud/backfill-batch', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                  track: item,
+                  tracks: chunk,
                   webhookUrl: webhookUrl.trim(),
+                  concurrency: 6,
                 }),
               });
               const data = await readJsonResponse<{
-                status?: 'updated' | 'no_source' | 'webhook_error';
-                message?: string;
-                lyricsType?: string;
-                hasNewCover?: boolean;
+                ok?: boolean;
+                results?: Array<{
+                  id?: string;
+                  r2AudioKey?: string;
+                  status?: 'updated' | 'no_source' | 'webhook_error';
+                  message?: string;
+                  title?: string;
+                  artist?: string;
+                  lyricsType?: string;
+                  hasNewCover?: boolean;
+                  fromR2Id3?: boolean;
+                }>;
                 error?: string;
               }>(res);
-              if (!res.ok) {
-                errors++;
-                pushLog(`[Lỗi] ${label}: ${data.error || `HTTP ${res.status}`}`);
-              } else if (data.status === 'updated') {
-                updated++;
-                const tags: string[] = [];
-                if (data.lyricsType && data.lyricsType !== 'Khong') tags.push(`Lyrics: ${data.lyricsType}`);
-                if (data.hasNewCover) tags.push('Ảnh mới');
-                pushLog(`[Đã bù${tags.length ? ` · ${tags.join(', ')}` : ''}] ${label}`);
-              } else if (data.status === 'no_source') {
-                noSource++;
-                pushLog(`[Chưa có nguồn] ${label}`);
+
+              if (!res.ok || !Array.isArray(data.results)) {
+                errors += chunk.length;
+                done += chunk.length;
+                pushLog(`[Lỗi lô ${chunk.length} bài]: ${data.error || `HTTP ${res.status}`}`);
               } else {
-                errors++;
-                pushLog(`[Lỗi Webhook] ${label}: ${data.message || 'Thất bại'}`);
+                const finishedKeys = new Set<string>();
+                const finishedIds = new Set<string>();
+
+                for (let i = 0; i < data.results.length; i++) {
+                  const r = data.results[i];
+                  const src = chunk[i];
+                  const label = `${r.artist || src?.artist ? `${r.artist || src?.artist} - ` : ''}${r.title || src?.title || src?.r2AudioKey}`;
+                  done++;
+                  if (r.status === 'updated') {
+                    updated++;
+                    if (r.fromR2Id3) fromR2Id3++;
+                    if (src?.id) finishedIds.add(src.id);
+                    if (src?.r2AudioKey) finishedKeys.add(src.r2AudioKey);
+                    const tags: string[] = [];
+                    if (r.fromR2Id3) tags.push('USLT sẵn trong R2');
+                    else if (r.lyricsType && r.lyricsType !== 'Khong') tags.push(`Lyrics: ${r.lyricsType}`);
+                    if (r.hasNewCover) tags.push('Ảnh mới');
+                    pushLog(`[Đã bù${tags.length ? ` · ${tags.join(', ')}` : ''}] ${label}`);
+                  } else if (r.status === 'no_source') {
+                    noSource++;
+                    if (src?.id) finishedIds.add(src.id);
+                    if (src?.r2AudioKey) finishedKeys.add(src.r2AudioKey);
+                    pushLog(`[Chưa có nguồn] ${label}`);
+                  } else {
+                    errors++;
+                    pushLog(`[Lỗi Webhook] ${label}: ${r.message || 'Thất bại'}`);
+                  }
+                }
+
+                if (finishedIds.size > 0 || finishedKeys.size > 0) {
+                  setCloudScanInfo((prev) => {
+                    if (!prev) return prev;
+                    const remaining = prev.tracks.filter(
+                      (t) =>
+                        !(t.id && finishedIds.has(t.id)) &&
+                        !(t.r2AudioKey && finishedKeys.has(t.r2AudioKey))
+                    );
+                    const remLyrics = remaining.filter((t) => t.missingLyrics && !t.isOrphanR2).length;
+                    const remCover = remaining.filter((t) => t.missingCover && !t.isOrphanR2).length;
+                    const remOrphan = remaining.filter((t) => t.isOrphanR2).length;
+                    return {
+                      ...prev,
+                      missingLyricsCount: remLyrics,
+                      missingCoverCount: remCover,
+                      orphanR2Count: remOrphan,
+                      tracks: remaining,
+                    };
+                  });
+                }
               }
             } catch (err) {
-              errors++;
-              pushLog(`[Lỗi mạng] ${label}: ${err instanceof Error ? err.message : 'Timeout'}`);
-            } finally {
-              done++;
-              setCloudProgress({
-                done,
-                total: targets.length,
-                updated,
-                noSource,
-                errors,
-                recentLogs: logs,
-              });
+              errors += chunk.length;
+              done += chunk.length;
+              pushLog(`[Lỗi mạng lô ${chunk.length} bài]: ${err instanceof Error ? err.message : 'Timeout'}`);
             }
+
+            setCloudProgress({
+              done,
+              total: targets.length,
+              updated,
+              fromR2Id3,
+              noSource,
+              errors,
+              rateLabel: formatSpeed(done),
+              recentLogs: logs,
+            });
           }
         })
       );
 
       if (stopCloudBackfillRef.current) {
-        showToast(`Đã dừng quét bù Cloud (${done}/${targets.length} bài · Đã bù ${updated} bài).`);
+        showToast(
+          `Đã tạm dừng quét bù Cloud (${done}/${targets.length} bài · Đã bù ${updated} bài, đọc sẵn từ R2: ${fromR2Id3}). Bấm tiếp để chạy phần còn lại!`
+        );
       } else {
-        showToast(`Hoàn tất quét bù Cloud: ${updated} bài đã cập nhật, ${noSource} chưa có nguồn, ${errors} lỗi.`);
+        showToast(
+          `Hoàn tất quét bù Cloud: ${updated} bài đã cập nhật (${fromR2Id3} bài lấy sẵn USLT từ R2), ${noSource} chưa có nguồn, ${errors} lỗi.`
+        );
       }
     } finally {
       setIsRunningCloudBackfill(false);
@@ -2490,10 +2635,10 @@ export function LocalEnrichView({
                   <Cloud className="h-4 w-4 text-cyan-400 shrink-0" />
                   <div className="min-w-0">
                     <div className="font-semibold text-cyan-100">
-                      Quét bù Lyrics &amp; Ảnh trực tiếp trên App / Cloudflare R2 (không cần file MP3 trên máy)
+                      Quét bù Siêu tốc từ Header R2 &amp; Kho Online (Chống nghẽn · Khôi phục USLT có sẵn trong MP3 R2)
                     </div>
                     <div className="text-[11px] text-slate-400">
-                      Chỉ dò tìm lyrics (LRCLIB · NetEase · Lyrics.ovh) + ảnh bìa thiếu và đẩy JSON lên App (0% tải MP3 qua Render).
+                      Ưu tiên đọc 64KB đầu file MP3 trên R2 để lấy ngay Lyrics USLT + Album đã nhúng (~20ms/bài, không nghẽn API), chỉ dò LRCLIB/NetEase/iTunes khi file R2 chưa có thẻ.
                     </div>
                   </div>
                 </div>
@@ -2502,7 +2647,7 @@ export function LocalEnrichView({
                   <button
                     type="button"
                     onClick={() => void handleScanCloudMissing()}
-                    disabled={isScanningCloud || isRunningCloudBackfill}
+                    disabled={isScanningCloud || isRunningCloudBackfill || isCleaningR2Duplicates}
                     className="h-8 px-2.5 rounded border border-white/[0.14] bg-white/[0.06] hover:bg-white/[0.12] disabled:opacity-45 text-xs text-slate-200 inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     {isScanningCloud ? (
@@ -2513,26 +2658,49 @@ export function LocalEnrichView({
                     <span>{isScanningCloud ? 'Đang quét...' : 'Quét lại App & R2'}</span>
                   </button>
 
+                  {cloudScanInfo && (cloudScanInfo.duplicateR2Count || 0) > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => void handleCleanupR2Duplicates()}
+                      disabled={isCleaningR2Duplicates || isRunningCloudBackfill || isScanningCloud}
+                      title="Xóa các file MP3 bị tải trùng lần 2 trên R2 (không nằm trong danh sách bài đang phát trên App)"
+                      className="h-8 px-2.5 rounded border border-rose-500/40 bg-rose-500/15 hover:bg-rose-500/25 disabled:opacity-45 text-xs font-medium text-rose-200 inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      {isCleaningR2Duplicates ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-rose-300" />
+                      ) : (
+                        <Trash2 className="h-3.5 w-3.5 text-rose-300" />
+                      )}
+                      <span>
+                        {isCleaningR2Duplicates
+                          ? 'Đang dọn R2 trùng...'
+                          : `Dọn ${cloudScanInfo.duplicateR2Count} file R2 trùng dư`}
+                      </span>
+                    </button>
+                  )}
+
                   {isRunningCloudBackfill ? (
                     <button
                       type="button"
                       onClick={handleStopCloudBackfill}
                       className="h-8 px-3 rounded bg-red-500/20 border border-red-500/40 hover:bg-red-500/30 text-red-200 font-semibold text-xs inline-flex items-center gap-1.5 cursor-pointer"
                     >
-                      <Square className="h-3 w-3 fill-current" />
-                      <span>Dừng bù</span>
+                      <Pause className="h-3 w-3 fill-current" />
+                      <span>Tạm dừng</span>
                     </button>
                   ) : (
                     cloudScanInfo &&
-                    cloudScanInfo.tracks.length > 0 && (
+                    filteredCloudTargets.length > 0 && (
                       <button
                         type="button"
                         onClick={() => void handleStartCloudBackfill()}
-                        disabled={isScanningCloud}
+                        disabled={isScanningCloud || isCleaningR2Duplicates}
                         className="h-8 px-3 rounded bg-cyan-400 hover:bg-cyan-300 disabled:opacity-45 text-[#090B0E] font-semibold text-xs inline-flex items-center gap-1.5 cursor-pointer"
                       >
                         <Play className="h-3 w-3 fill-current" />
-                        <span>Tự tìm &amp; Bù ({cloudScanInfo.tracks.length} bài)</span>
+                        <span>
+                          Chạy bù Không nghẽn ({filteredCloudTargets.length} bài)
+                        </span>
                       </button>
                     )
                   )}
@@ -2541,7 +2709,7 @@ export function LocalEnrichView({
                     type="button"
                     onClick={() => handleDownloadWindowsSyncBat('cloud')}
                     disabled={isRunningCloudBackfill}
-                    title="Tải SpotFlow-QuetBu-Cloud-R2.bat: Không cần file trên máy — tự tải MP3 từ R2 về PC nhúng thẻ USLT + ảnh vào ruột file MP3 R2 rồi cập nhật App"
+                    title="Tải SpotFlow-QuetBu-Cloud-R2.bat: Chạy trực tiếp trên PC (10 luồng, đọc nhanh 64KB R2 + nhúng USLT vào R2)"
                     className="h-8 px-2.5 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-45 text-xs font-medium text-amber-200 inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     <Download className="h-3.5 w-3.5 text-amber-400" />
@@ -2562,29 +2730,93 @@ export function LocalEnrichView({
               </div>
 
               {cloudScanInfo && (
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pt-2 border-t border-white/[0.08] font-mono text-[11px] text-slate-300">
-                  <span>
-                    App: <strong className="text-white">{cloudScanInfo.totalAppTracks}</strong> bài
-                  </span>
-                  {cloudScanInfo.r2TotalCount !== null && (
+                <div className="space-y-2 pt-2 border-t border-white/[0.08]">
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-[11px] text-slate-300">
                     <span>
-                      R2: <strong className="text-white">{cloudScanInfo.r2TotalCount}</strong> MP3
+                      App: <strong className="text-white">{cloudScanInfo.totalAppTracks}</strong> bài
                     </span>
-                  )}
-                  <span className="text-amber-300">
-                    Thiếu lyrics: <strong>{cloudScanInfo.missingLyricsCount}</strong>
-                  </span>
-                  <span className="text-amber-300">
-                    Thiếu ảnh: <strong>{cloudScanInfo.missingCoverCount}</strong>
-                  </span>
-                  {cloudScanInfo.orphanR2Count > 0 && (
-                    <span className="text-sky-300">
-                      R2 chưa lên App: <strong>{cloudScanInfo.orphanR2Count}</strong>
+                    {cloudScanInfo.r2TotalCount !== null && (
+                      <span>
+                        R2: <strong className="text-white">{cloudScanInfo.r2TotalCount}</strong> MP3
+                      </span>
+                    )}
+                    <span className="text-amber-300">
+                      Thiếu lyrics trên App: <strong>{cloudScanInfo.missingLyricsCount}</strong>
                     </span>
-                  )}
-                  <span className="text-cyan-300">
-                    Cần xử lý: <strong>{cloudScanInfo.tracks.length}</strong> bài
-                  </span>
+                    <span className="text-amber-300">
+                      Thiếu ảnh: <strong>{cloudScanInfo.missingCoverCount}</strong>
+                    </span>
+                    {cloudScanInfo.orphanR2Count > 0 && (
+                      <span className="text-sky-300">
+                        Bài R2 mới chưa lên App: <strong>{cloudScanInfo.orphanR2Count}</strong>
+                      </span>
+                    )}
+                    {(cloudScanInfo.duplicateR2Count || 0) > 0 && (
+                      <span
+                        title="Các file MP3 tải trùng lần 2 trên R2 của những bài đã có trên App — đã được tách khỏi danh sách cần xử lý để không gây nghẽn"
+                        className="text-rose-300"
+                      >
+                        R2 trùng dư (đã loại khỏi hàng đợi): <strong>{cloudScanInfo.duplicateR2Count}</strong> file
+                      </span>
+                    )}
+                    <span className="text-cyan-300">
+                      Cần xử lý thật: <strong>{cloudScanInfo.tracks.length}</strong> bài
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] text-slate-400 mr-1">Chế độ lọc:</span>
+                    <button
+                      type="button"
+                      disabled={isRunningCloudBackfill}
+                      onClick={() => setCloudFilterMode('all')}
+                      className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                        cloudFilterMode === 'all'
+                          ? 'bg-cyan-400 text-[#090B0E] font-semibold'
+                          : 'bg-white/[0.06] text-slate-300 hover:bg-white/[0.12]'
+                      }`}
+                    >
+                      Tất cả cần bù ({cloudScanInfo.tracks.length})
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isRunningCloudBackfill}
+                      onClick={() => setCloudFilterMode('lyrics')}
+                      className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                        cloudFilterMode === 'lyrics'
+                          ? 'bg-cyan-400 text-[#090B0E] font-semibold'
+                          : 'bg-white/[0.06] text-slate-300 hover:bg-white/[0.12]'
+                      }`}
+                    >
+                      Thiếu Lyrics ({cloudScanInfo.missingLyricsCount})
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isRunningCloudBackfill}
+                      onClick={() => setCloudFilterMode('cover')}
+                      className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                        cloudFilterMode === 'cover'
+                          ? 'bg-cyan-400 text-[#090B0E] font-semibold'
+                          : 'bg-white/[0.06] text-slate-300 hover:bg-white/[0.12]'
+                      }`}
+                    >
+                      Chỉ thiếu Ảnh ({cloudScanInfo.missingCoverCount})
+                    </button>
+                    {cloudScanInfo.orphanR2Count > 0 && (
+                      <button
+                        type="button"
+                        disabled={isRunningCloudBackfill}
+                        onClick={() => setCloudFilterMode('orphan')}
+                        className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                          cloudFilterMode === 'orphan'
+                            ? 'bg-cyan-400 text-[#090B0E] font-semibold'
+                            : 'bg-white/[0.06] text-slate-300 hover:bg-white/[0.12]'
+                        }`}
+                      >
+                        Bài R2 mới ({cloudScanInfo.orphanR2Count})
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -2601,10 +2833,15 @@ export function LocalEnrichView({
                       {cloudProgress.total > 0
                         ? Math.round((cloudProgress.done / cloudProgress.total) * 100)
                         : 0}
-                      %)
+                      %) · {cloudProgress.rateLabel}
                     </span>
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-3">
                       <span className="text-[#1DB954]">Đã bù: {cloudProgress.updated}</span>
+                      {cloudProgress.fromR2Id3 > 0 && (
+                        <span className="text-cyan-300">
+                          Lấy sẵn USLT từ R2: {cloudProgress.fromR2Id3}
+                        </span>
+                      )}
                       <span className="text-slate-400">Chưa có nguồn: {cloudProgress.noSource}</span>
                       {cloudProgress.errors > 0 && (
                         <span className="text-red-400">Lỗi: {cloudProgress.errors}</span>
