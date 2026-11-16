@@ -1434,6 +1434,162 @@ async function uploadJobToR2(job: DownloadJob): Promise<void> {
   job.storageProvider = 'r2';
 }
 
+function parseLrcToSoundlyLyrics(
+  syncedLyrics?: string | null,
+  plainLyrics?: string | null,
+  durationSec?: number
+): Array<{ time: number; text: string }> {
+  if (syncedLyrics && syncedLyrics.trim()) {
+    const out: Array<{ time: number; text: string }> = [];
+    const lines = syncedLyrics.split(/\r?\n/);
+    const timeRegex = /\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]/g;
+    for (const line of lines) {
+      const times: number[] = [];
+      let m: RegExpExecArray | null;
+      timeRegex.lastIndex = 0;
+      while ((m = timeRegex.exec(line)) !== null) {
+        const min = parseInt(m[1], 10);
+        const sec = parseInt(m[2], 10);
+        const fracRaw = m[3] || '0';
+        const ms = parseInt(fracRaw.padEnd(3, '0').slice(0, 3), 10);
+        if (!Number.isNaN(min) && !Number.isNaN(sec)) {
+          times.push(Math.round((min * 60 + sec + ms / 1000) * 100) / 100);
+        }
+      }
+      if (times.length > 0) {
+        const text = line.replace(timeRegex, '').trim();
+        if (text) {
+          for (const t of times) {
+            out.push({ time: t, text });
+          }
+        }
+      }
+    }
+    if (out.length > 0) {
+      out.sort((a, b) => a.time - b.time);
+      return out;
+    }
+  }
+
+  if (plainLyrics && plainLyrics.trim()) {
+    const cleanLines = plainLyrics
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (cleanLines.length > 0) {
+      const dur = Math.max(60, durationSec && durationSec > 30 ? durationSec : 180);
+      const step = Math.max(30, dur - 8) / cleanLines.length;
+      return cleanLines.map((text, idx) => ({
+        time: Math.round((3 + idx * step) * 10) / 10,
+        text,
+      }));
+    }
+  }
+
+  return [];
+}
+
+function deriveAppOriginFromUrl(urlCandidate?: string): string {
+  const raw = String(urlCandidate || '').trim();
+  if (!raw) return '';
+  try {
+    return new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`).origin;
+  } catch {
+    return '';
+  }
+}
+
+async function patchSoundlyTracksBatch(
+  appOrigin: string,
+  updates: Array<{ id: string; patch: Record<string, unknown> }>
+): Promise<{
+  success: boolean;
+  supported: boolean;
+  status: number;
+  message: string;
+}> {
+  if (!appOrigin || updates.length === 0) {
+    return { success: false, supported: true, status: 400, message: 'Thiếu appOrigin hoặc danh sách cập nhật.' };
+  }
+  const url = `${appOrigin.replace(/\/+$/, '')}/api/tracks/batch-update`;
+  try {
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(integrationSettings.apiKey ? { 'X-API-Key': integrationSettings.apiKey } : {}),
+      },
+      body: JSON.stringify({ updates }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (res.status === 404 || res.status === 405) {
+      return { success: false, supported: false, status: res.status, message: `HTTP ${res.status}` };
+    }
+
+    const respText = await res.text().catch(() => '');
+    const trimmed = respText.trim();
+    if (trimmed.startsWith('<')) {
+      return {
+        success: false,
+        supported: false,
+        status: res.status || 502,
+        message: 'App trả về HTML thay vì API JSON (/api/tracks/batch-update).',
+      };
+    }
+
+    let parsedMsg = '';
+    let logicalError = false;
+    if (trimmed) {
+      try {
+        const json = JSON.parse(trimmed) as {
+          ok?: boolean;
+          success?: boolean;
+          updated?: number;
+          updatedCount?: number;
+          message?: string;
+          error?: string;
+        };
+        parsedMsg = json.message || json.error || '';
+        if (
+          json.ok === false ||
+          json.success === false ||
+          (typeof json.error === 'string' && json.error.trim().length > 0) ||
+          (typeof json.updated === 'number' && json.updated === 0) ||
+          (typeof json.updatedCount === 'number' && json.updatedCount === 0)
+        ) {
+          logicalError = true;
+        }
+      } catch {
+        parsedMsg = trimmed.slice(0, 140);
+      }
+    }
+
+    if (res.ok && !logicalError) {
+      return {
+        success: true,
+        supported: true,
+        status: res.status,
+        message: parsedMsg || `Đã cập nhật trực tiếp ${updates.length} bài trên App (${res.status})`,
+      };
+    }
+
+    return {
+      success: false,
+      supported: true,
+      status: res.ok ? 422 : res.status,
+      message: parsedMsg ? `App báo lỗi ${res.status}: ${parsedMsg}` : `App phản hồi lỗi HTTP ${res.status}`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      supported: true,
+      status: 500,
+      message: err instanceof Error ? err.message : 'Không thể kết nối /api/tracks/batch-update trên App.',
+    };
+  }
+}
+
 async function pushJobToWebhook(
   job: DownloadJob,
   reqHost: string,
@@ -1464,6 +1620,9 @@ async function pushJobToWebhook(
     const finalAudioUrl = job.r2AudioUrl || fallbackDownloadUrl;
     const finalCoverUrl = job.r2CoverUrl || job.coverUrl || null;
     const storageMode = job.r2AudioUrl ? 'r2' : 'spotflow';
+    const durSec = job.durationMs ? Math.round(job.durationMs / 1000) : 0;
+    const parsedLyrics = parseLrcToSoundlyLyrics(job.syncedLyrics, job.plainLyrics, durSec);
+    const lyricsMode = job.syncedLyrics ? 'synced' : job.plainLyrics ? 'plain' : undefined;
 
     const payload = {
       event: 'track_downloaded',
@@ -1488,6 +1647,8 @@ async function pushJobToWebhook(
         durationMs: job.durationMs || 0,
         syncedLyrics: job.syncedLyrics || null,
         plainLyrics: job.plainLyrics || null,
+        ...(parsedLyrics.length > 0 ? { lyrics: parsedLyrics } : {}),
+        ...(lyricsMode ? { lyricsMode } : {}),
       },
     };
 
@@ -1502,25 +1663,49 @@ async function pushJobToWebhook(
     });
 
     const respText = await res.text().catch(() => '');
+    const trimmedResp = respText.trim();
     let parsedMsg = '';
     let logicalError = false;
-    try {
-      const json = JSON.parse(respText) as {
-        ok?: boolean;
-        success?: boolean;
-        message?: string;
-        error?: string;
-      };
-      parsedMsg = json.message || json.error || '';
-      if (
-        json.success === false ||
-        json.ok === false ||
-        (typeof json.error === 'string' && json.error.trim().length > 0)
-      ) {
-        logicalError = true;
+    if (trimmedResp.startsWith('<')) {
+      logicalError = true;
+      parsedMsg = 'Webhook URL trả về trang HTML thay vì JSON API';
+    } else {
+      try {
+        const json = JSON.parse(trimmedResp) as {
+          ok?: boolean;
+          success?: boolean;
+          skipped?: boolean;
+          duplicate?: boolean;
+          ignored?: boolean;
+          updated?: boolean;
+          added?: boolean;
+          status?: string;
+          action?: string;
+          message?: string;
+          error?: string;
+        };
+        parsedMsg = json.message || json.error || '';
+        const isSilentSkip =
+          json.skipped === true ||
+          json.duplicate === true ||
+          json.ignored === true ||
+          (json.updated === false && json.added === false) ||
+          (typeof json.status === 'string' && /skip|ignore|duplicate/i.test(json.status)) ||
+          (typeof json.action === 'string' && /skip|ignore|duplicate/i.test(json.action));
+        if (
+          json.success === false ||
+          json.ok === false ||
+          isSilentSkip ||
+          (typeof json.error === 'string' && json.error.trim().length > 0)
+        ) {
+          logicalError = true;
+          if (isSilentSkip && !parsedMsg) {
+            parsedMsg = 'Webhook bỏ qua bài đã tồn tại (không ghi đè bài cũ)';
+          }
+        }
+      } catch {
+        parsedMsg = trimmedResp.slice(0, 140);
       }
-    } catch {
-      parsedMsg = respText.slice(0, 140);
     }
 
     if (res.ok && !logicalError) {
@@ -2155,7 +2340,55 @@ async function startServer() {
       jobs.set(jobId, job);
 
       const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
-      if (body.autoPush && effectiveWebhook) {
+      const appOrigin = deriveAppOriginFromUrl(effectiveWebhook);
+      const isExistingAppTrackId = /^(r2-|spotflow-|uploaded-)/i.test(trackIdOverride);
+
+      if (body.autoPush && isExistingAppTrackId && appOrigin) {
+        const durSec = job.durationMs ? Math.round(job.durationMs / 1000) : 0;
+        const parsedLyrics = parseLrcToSoundlyLyrics(job.syncedLyrics, job.plainLyrics, durSec);
+        const patch: Record<string, unknown> = {
+          id3Checked: true,
+          aiReason: 'Đồng bộ trực tiếp Cloudflare R2 từ SpotFlow MP3',
+        };
+        if (job.album) patch.album = job.album;
+        if (job.artist) patch.artist = job.artist;
+        if (job.title) patch.title = job.title;
+        if (job.r2CoverUrl || job.coverUrl) patch.coverUrl = job.r2CoverUrl || job.coverUrl;
+        if (job.r2CoverKey) patch.r2CoverKey = job.r2CoverKey;
+        if (job.syncedLyrics) {
+          patch.syncedLyrics = job.syncedLyrics;
+          patch.lyricsMode = 'synced';
+        }
+        if (job.plainLyrics) {
+          patch.plainLyrics = job.plainLyrics;
+          if (!patch.lyricsMode) patch.lyricsMode = 'plain';
+        }
+        if (parsedLyrics.length > 0) patch.lyrics = parsedLyrics;
+        const patchRes = await patchSoundlyTracksBatch(appOrigin, [{ id: trackIdOverride, patch }]);
+        if (patchRes.success) {
+          job.webhookStatus = 'pushed';
+          job.webhookMessage = patchRes.message;
+          job.pushedAt = new Date().toISOString();
+          job.updatedAt = Date.now();
+          await upsertUploadHistoryItem({
+            title: job.title,
+            artist: job.artist,
+            album: job.album,
+            fileName: job.sourceFileName || job.fileName || safeName,
+            fileSizeBytes: job.fileSizeBytes,
+            pushedToApp: true,
+            pushedAt: job.pushedAt,
+          });
+        } else if (!patchRes.supported && effectiveWebhook) {
+          const host = req.get('host') || 'localhost:3000';
+          const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+          await pushJobToWebhook(job, host, proto, effectiveWebhook);
+        } else {
+          job.webhookStatus = 'error';
+          job.webhookMessage = patchRes.message;
+          job.updatedAt = Date.now();
+        }
+      } else if (body.autoPush && effectiveWebhook) {
         const host = req.get('host') || 'localhost:3000';
         const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
         await pushJobToWebhook(job, host, proto, effectiveWebhook);
@@ -3083,15 +3316,26 @@ async function runCloudRepairNoLocal() {
               }),
             }, { timeoutMs: 25000, retries: 2 });
             if (compRes.ok) {
-              totalRepaired++;
+              const compData = await compRes.json().catch(() => ({}));
+              const pushedOk = compData && compData.job && compData.job.webhookStatus === 'pushed';
               processedCount++;
               const pct = Math.round((processedCount / targets.length) * 100);
-              console.log(
-                '  [DOC NHANH R2 ' + processedCount + '/' + targets.length + ' · ' + pct + '% · ' + formatRate(processedCount, startedAt) + '] ' +
-                (fastArtist ? fastArtist + ' - ' : '') + fastTitle +
-                ' | Lyrics: ' + (fastSynced ? 'Synced (USLT R2)' : 'Thuong (USLT R2)') +
-                ' | Album: ' + (fastAlbum || 'R2') + ' -> App OK'
-              );
+              if (pushedOk) {
+                totalRepaired++;
+                console.log(
+                  '  [DOC NHANH R2 ' + processedCount + '/' + targets.length + ' · ' + pct + '% · ' + formatRate(processedCount, startedAt) + '] ' +
+                  (fastArtist ? fastArtist + ' - ' : '') + fastTitle +
+                  ' | Lyrics: ' + (fastSynced ? 'Synced (USLT R2)' : 'Thuong (USLT R2)') +
+                  ' | Album: ' + (fastAlbum || 'R2') + ' -> App OK'
+                );
+              } else {
+                totalErrors++;
+                const errMsg = (compData && compData.job && compData.job.webhookMessage) || 'Webhook that bai';
+                console.error(
+                  '  [LOI WEBHOOK ' + processedCount + '/' + targets.length + '] ' +
+                  (fastArtist ? fastArtist + ' - ' : '') + fastTitle + ': ' + errMsg
+                );
+              }
               return;
             }
           }
@@ -4077,6 +4321,14 @@ run().catch((err) => {
       };
     }
 
+    const effectiveDurSec =
+      t.duration && t.duration > 30 && t.duration !== 60 && t.duration !== 210
+        ? Number(t.duration)
+        : enriched.durationMs > 30000
+          ? Math.round(enriched.durationMs / 1000)
+          : 0;
+    const parsedLyrics = parseLrcToSoundlyLyrics(syncedLyrics, plainLyrics, effectiveDurSec);
+
     const jobId = `cloud_${crypto.randomBytes(6).toString('hex')}`;
     const job: DownloadJob = {
       jobId,
@@ -4105,14 +4357,47 @@ run().catch((err) => {
       storageProvider: resolvedAudioUrl ? 'r2' : 'spotflow',
     };
 
-    const pushOutcome = await pushJobToWebhook(job, reqHost, reqProtocol, effectiveWebhook);
+    const patch: Record<string, unknown> = {
+      id3Checked: true,
+    };
+    if (gainedLyrics) {
+      if (syncedLyrics) {
+        patch.syncedLyrics = syncedLyrics;
+        patch.lyricsMode = 'synced';
+      }
+      if (plainLyrics) {
+        patch.plainLyrics = plainLyrics;
+        if (!patch.lyricsMode) patch.lyricsMode = 'plain';
+      }
+      if (parsedLyrics.length > 0) {
+        patch.lyrics = parsedLyrics;
+      }
+    }
+    if (gainedAlbum) {
+      patch.album = finalAlbum;
+    }
+    if (gainedCover && finalCoverUrl) {
+      patch.coverUrl = finalCoverUrl;
+      if (newR2CoverKey || derivedExistingCoverKey) {
+        patch.r2CoverKey = newR2CoverKey || derivedExistingCoverKey;
+      }
+    }
+    if ((!t.artist || t.artist === 'Nghệ sĩ R2') && finalArtist) {
+      patch.artist = finalArtist;
+    }
+    if ((!t.duration || t.duration <= 60 || t.duration === 210) && effectiveDurSec > 30) {
+      patch.duration = effectiveDurSec;
+    }
+    if (t.album === 'Kho nhạc Cloudflare R2') {
+      patch.aiReason = 'Đồng bộ trực tiếp Cloudflare R2 từ SpotFlow MP3';
+    }
 
-    return {
+    const preparedResult = {
       id: String(t.id || ''),
       r2AudioKey: String(t.r2AudioKey || ''),
-      status: (pushOutcome.success ? 'updated' : 'webhook_error') as 'updated' | 'webhook_error',
-      httpStatus: pushOutcome.status,
-      message: pushOutcome.message,
+      status: 'updated' as const,
+      httpStatus: 200,
+      message: '',
       title: finalTitle,
       artist: finalArtist,
       album: finalAlbum,
@@ -4120,6 +4405,57 @@ run().catch((err) => {
       lyricsType: syncedLyrics ? 'Synced' : plainLyrics ? 'Thuong' : 'Khong',
       hasNewCover: gainedCover,
       fromR2Id3,
+      _defer: {
+        isOrphanR2: Boolean(t.isOrphanR2),
+        patch,
+        job,
+      },
+    };
+
+    if (effectiveWebhook === '__DEFER__') {
+      return preparedResult;
+    }
+
+    const appOrigin = deriveAppOriginFromUrl(effectiveWebhook);
+    if (!t.isOrphanR2 && t.id && appOrigin) {
+      const patchOutcome = await patchSoundlyTracksBatch(appOrigin, [{ id: t.id, patch }]);
+      if (patchOutcome.success) {
+        await upsertUploadHistoryItem({
+          title: job.title,
+          artist: job.artist,
+          album: job.album,
+          fileName: job.fileName || `${job.artist} - ${job.title}.mp3`,
+          fileSizeBytes: job.fileSizeBytes,
+          pushedToApp: true,
+          pushedAt: new Date().toISOString(),
+        });
+        return {
+          ...preparedResult,
+          _defer: undefined,
+          status: 'updated' as const,
+          httpStatus: patchOutcome.status,
+          message: patchOutcome.message,
+        };
+      }
+      if (patchOutcome.supported) {
+        return {
+          ...preparedResult,
+          _defer: undefined,
+          status: 'webhook_error' as const,
+          httpStatus: patchOutcome.status,
+          message: patchOutcome.message,
+        };
+      }
+    }
+
+    const pushOutcome = await pushJobToWebhook(job, reqHost, reqProtocol, effectiveWebhook);
+
+    return {
+      ...preparedResult,
+      _defer: undefined,
+      status: (pushOutcome.success ? 'updated' : 'webhook_error') as 'updated' | 'webhook_error',
+      httpStatus: pushOutcome.status,
+      message: pushOutcome.message,
     };
   };
 
@@ -4128,6 +4464,7 @@ run().catch((err) => {
       const body = (req.body || {}) as {
         track?: CloudMissingTrackPayload;
         webhookUrl?: string;
+        appOrigin?: string;
         focusMode?: 'all' | 'lyrics' | 'cover' | 'orphan';
       };
       const t = body.track;
@@ -4136,15 +4473,16 @@ run().catch((err) => {
         return;
       }
       const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
-      if (!effectiveWebhook) {
-        res.status(400).json({ error: 'Chưa cấu hình Webhook URL để cập nhật lên App Nhạc.' });
+      const resolvedAppOrigin = deriveAppOriginFromUrl(body.appOrigin || effectiveWebhook);
+      if (!effectiveWebhook && (!resolvedAppOrigin || t.isOrphanR2)) {
+        res.status(400).json({ error: 'Chưa cấu hình Webhook URL hoặc App URL để cập nhật lên App Nhạc.' });
         return;
       }
       const reqHost = req.get('host') || 'localhost:3000';
       const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
       const outcome = await backfillSingleCloudTrack(
         t,
-        effectiveWebhook,
+        effectiveWebhook || resolvedAppOrigin,
         reqHost,
         reqProtocol,
         body.focusMode || 'all'
@@ -4162,6 +4500,7 @@ run().catch((err) => {
       const body = (req.body || {}) as {
         tracks?: CloudMissingTrackPayload[];
         webhookUrl?: string;
+        appOrigin?: string;
         concurrency?: number;
         focusMode?: 'all' | 'lyrics' | 'cover' | 'orphan';
       };
@@ -4171,7 +4510,8 @@ run().catch((err) => {
         return;
       }
       const effectiveWebhook = (body.webhookUrl || integrationSettings.webhookUrl || '').trim();
-      if (!effectiveWebhook) {
+      const resolvedAppOrigin = deriveAppOriginFromUrl(body.appOrigin || effectiveWebhook);
+      if (!effectiveWebhook && !resolvedAppOrigin) {
         res.status(400).json({ error: 'Chưa cấu hình Webhook URL để cập nhật lên App Nhạc.' });
         return;
       }
@@ -4180,7 +4520,8 @@ run().catch((err) => {
       const reqProtocol = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
       const focusMode = body.focusMode || 'all';
       const workerCount = Math.min(Math.max(Number(body.concurrency) || 6, 2), 8, tracks.length);
-      const results = new Array<Awaited<ReturnType<typeof backfillSingleCloudTrack>>>(tracks.length);
+      type BackfillOutcome = Awaited<ReturnType<typeof backfillSingleCloudTrack>>;
+      const prepared = new Array<BackfillOutcome>(tracks.length);
       let cursor = 0;
 
       await Promise.all(
@@ -4190,15 +4531,15 @@ run().catch((err) => {
             if (idx >= tracks.length) break;
             const item = tracks[idx];
             try {
-              results[idx] = await backfillSingleCloudTrack(
+              prepared[idx] = await backfillSingleCloudTrack(
                 item,
-                effectiveWebhook,
+                '__DEFER__',
                 reqHost,
                 reqProtocol,
                 focusMode
               );
             } catch (err) {
-              results[idx] = {
+              prepared[idx] = {
                 id: String(item.id || ''),
                 r2AudioKey: String(item.r2AudioKey || ''),
                 status: 'webhook_error',
@@ -4211,11 +4552,123 @@ run().catch((err) => {
                 lyricsType: 'Khong',
                 hasNewCover: false,
                 fromR2Id3: false,
+                _defer: undefined,
               };
             }
           }
         })
       );
+
+      // Partition items that need persistence into:
+      // 1) Existing App tracks -> single PATCH /api/tracks/batch-update per chunk
+      // 2) New orphan R2 tracks -> POST Webhook (with fallback if batch-update isn't supported)
+      const existingIndices: number[] = [];
+      const orphanIndices: number[] = [];
+      for (let i = 0; i < prepared.length; i++) {
+        const p = prepared[i] as BackfillOutcome & {
+          _defer?: { isOrphanR2: boolean; patch: Record<string, unknown>; job: DownloadJob };
+        };
+        if (!p || !p._defer) continue;
+        if (!p._defer.isOrphanR2 && p.id && resolvedAppOrigin) {
+          existingIndices.push(i);
+        } else {
+          orphanIndices.push(i);
+        }
+      }
+
+      if (existingIndices.length > 0 && resolvedAppOrigin) {
+        const updatesPayload = existingIndices.map((idx) => {
+          const p = prepared[idx] as BackfillOutcome & {
+            _defer: { isOrphanR2: boolean; patch: Record<string, unknown>; job: DownloadJob };
+          };
+          return { id: p.id, patch: p._defer.patch };
+        });
+
+        const batchOutcome = await patchSoundlyTracksBatch(resolvedAppOrigin, updatesPayload);
+        if (batchOutcome.success) {
+          const nowIso = new Date().toISOString();
+          await Promise.all(
+            existingIndices.map(async (idx) => {
+              const p = prepared[idx] as BackfillOutcome & {
+                _defer: { job: DownloadJob };
+              };
+              const job = p._defer.job;
+              await upsertUploadHistoryItem({
+                title: job.title,
+                artist: job.artist,
+                album: job.album,
+                fileName: job.fileName || `${job.artist} - ${job.title}.mp3`,
+                fileSizeBytes: job.fileSizeBytes,
+                pushedToApp: true,
+                pushedAt: nowIso,
+              });
+              prepared[idx] = {
+                ...p,
+                _defer: undefined,
+                status: 'updated',
+                httpStatus: batchOutcome.status,
+                message: batchOutcome.message,
+              };
+            })
+          );
+        } else if (!batchOutcome.supported) {
+          // App does not implement /api/tracks/batch-update -> fallback to Webhook push
+          orphanIndices.push(...existingIndices);
+        } else {
+          for (const idx of existingIndices) {
+            const p = prepared[idx];
+            prepared[idx] = {
+              ...p,
+              _defer: undefined,
+              status: 'webhook_error',
+              httpStatus: batchOutcome.status,
+              message: batchOutcome.message,
+            };
+          }
+        }
+      }
+
+      if (orphanIndices.length > 0) {
+        let orphanCursor = 0;
+        const orphanWorkers = Math.min(4, orphanIndices.length);
+        await Promise.all(
+          Array.from({ length: orphanWorkers }, async () => {
+            while (true) {
+              const pos = orphanCursor++;
+              if (pos >= orphanIndices.length) break;
+              const idx = orphanIndices[pos];
+              const p = prepared[idx] as BackfillOutcome & {
+                _defer: { job: DownloadJob };
+              };
+              if (!effectiveWebhook) {
+                prepared[idx] = {
+                  ...p,
+                  _defer: undefined,
+                  status: 'webhook_error',
+                  httpStatus: 400,
+                  message: 'Chưa cấu hình Webhook URL để thêm bài R2 mới lên App.',
+                };
+                continue;
+              }
+              const pushOutcome = await pushJobToWebhook(p._defer.job, reqHost, reqProtocol, effectiveWebhook);
+              prepared[idx] = {
+                ...p,
+                _defer: undefined,
+                status: pushOutcome.success ? 'updated' : 'webhook_error',
+                httpStatus: pushOutcome.status,
+                message: pushOutcome.message,
+              };
+            }
+          })
+        );
+      }
+
+      const results = prepared.map((p) => {
+        if (!p || typeof p !== 'object') return p;
+        const copy = { ...p } as Record<string, unknown>;
+        delete copy._defer;
+        return copy;
+      });
 
       res.json({ ok: true, results });
     } catch (err) {

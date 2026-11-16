@@ -84,8 +84,11 @@ export function IntegrationModal({
        - coverUrl = track.r2CoverUrl || track.coverUrl || null
        - r2AudioKey = track.r2AudioKey (lưu nếu DB quản lý key để xóa file sau này)
        - r2CoverKey = track.r2CoverKey
-     * Ghi thẳng 1 bản ghi bài hát mới (title, artist, album, durationMs, audioUrl, coverUrl, syncedLyrics, plainLyrics) vào Database của App Nhạc và trả về HTTP 200 { "ok": true }.
-   - Nếu có lỗi lưu Database hoặc thiếu audioUrl: PHẢI trả về mã lỗi HTTP 4xx/5xx (hoặc { "ok": false, "error": "..." }) thay vì { "ok": true }.
+     * UPSERT theo id / r2AudioKey / audioUrl:
+       - Nếu bài chưa có: tạo bản ghi mới với title, artist, album, durationMs, audioUrl, coverUrl, syncedLyrics, plainLyrics, lyrics, lyricsMode.
+       - Nếu bài ĐÃ TỒN TẠI (kể cả bài r2-* khôi phục từ R2): CẬP NHẬT/TRỘN thêm syncedLyrics, plainLyrics, lyrics, lyricsMode, album (nếu cũ là "Kho nhạc Cloudflare R2"), coverUrl mới thay vì bỏ qua im lặng!
+     * Trả về HTTP 200 { "ok": true, "action": "inserted" | "updated" }.
+   - Nếu bỏ qua không lưu hoặc gặp lỗi DB/thiếu audioUrl: PHẢI trả về HTTP 4xx/5xx (hoặc { "ok": false, "skipped": true, "error": "..." }) thay vì { "ok": true }.
 
 3. Fallback cho luồng cũ (khi track.storage !== "r2"):
    - Tải MP3 từ track.downloadUrl & ảnh từ track.coverUrl rồi upload lên R2 (tracks/<slug>-<timestamp>.mp3, covers/<slug>-<timestamp>.jpg) trước khi ghi DB.

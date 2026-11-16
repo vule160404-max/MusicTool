@@ -2188,7 +2188,8 @@ export function LocalEnrichView({
       await handleScanCloudMissing();
       return;
     }
-    if (!webhookUrl.trim() && !cloudScanInfo.webhookConfigured) {
+    const effectiveAppOrigin = cloudScanInfo.appOrigin || '';
+    if (!webhookUrl.trim() && !cloudScanInfo.webhookConfigured && !effectiveAppOrigin) {
       showToast('Vui lòng cấu hình Webhook URL của App Nhạc để đẩy dữ liệu quét bù.');
       onOpenIntegrationModal();
       return;
@@ -2253,6 +2254,7 @@ export function LocalEnrichView({
                 body: JSON.stringify({
                   tracks: chunk,
                   webhookUrl: webhookUrl.trim(),
+                  appOrigin: effectiveAppOrigin,
                   concurrency: 6,
                   focusMode: cloudFilterMode,
                 }),
@@ -2304,7 +2306,7 @@ export function LocalEnrichView({
                     pushLog(`[Chưa có nguồn] ${label}`);
                   } else {
                     errors++;
-                    pushLog(`[Lỗi Webhook] ${label}: ${r.message || 'Thất bại'}`);
+                    pushLog(`[Lỗi App/Webhook] ${label}: ${r.message || 'Thất bại'}`);
                     if ((r.httpStatus === 401 || r.httpStatus === 403) && !authErrorAlerted) {
                       authErrorAlerted = true;
                       stopCloudBackfillRef.current = true;
@@ -2365,8 +2367,27 @@ export function LocalEnrichView({
           `Đã tạm dừng quét bù Cloud (${done}/${targets.length} bài · Đã bù ${updated} bài, đọc sẵn từ R2: ${fromR2Id3}). Bấm tiếp để chạy phần còn lại!`
         );
       } else {
+        // Re-verify true counts directly from Soundly API after finishing a full backfill pass
+        if (updated > 0) {
+          try {
+            const verifyRes = await apiFetch('/api/cloud/scan-missing', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                webhookUrl: webhookUrl.trim(),
+                includeR2: true,
+              }),
+            });
+            if (verifyRes.ok) {
+              const verified = await readJsonResponse<CloudScanSummary>(verifyRes);
+              setCloudScanInfo(verified);
+            }
+          } catch {
+            // Keep optimistic count if verify request fails
+          }
+        }
         showToast(
-          `Hoàn tất quét bù Cloud: ${updated} bài đã cập nhật (${fromR2Id3} bài lấy sẵn USLT từ R2), ${noSource} chưa có nguồn, ${errors} lỗi.`
+          `Hoàn tất quét bù Cloud: ${updated} bài đã ghi lên App (${fromR2Id3} bài lấy sẵn USLT từ R2), ${noSource} chưa có nguồn, ${errors} lỗi.`
         );
       }
     } finally {
