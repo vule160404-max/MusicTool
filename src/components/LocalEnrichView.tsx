@@ -2062,7 +2062,8 @@ export function LocalEnrichView({
 
     setIsCleaningR2Duplicates(true);
     let totalDeleted = 0;
-    const chunkSize = 250;
+    let totalDeletedCovers = 0;
+    const chunkSize = 2500;
     try {
       for (let i = 0; i < dupKeys.length; i += chunkSize) {
         const chunk = dupKeys.slice(i, i + chunkSize);
@@ -2072,13 +2073,20 @@ export function LocalEnrichView({
           body: JSON.stringify({
             keys: chunk,
             webhookUrl: webhookUrl.trim(),
+            includeOrphanCovers: true,
           }),
         });
-        const data = await readJsonResponse<{ ok?: boolean; deletedCount?: number; error?: string }>(res);
+        const data = await readJsonResponse<{
+          ok?: boolean;
+          deletedCount?: number;
+          deletedCoversCount?: number;
+          error?: string;
+        }>(res);
         if (!res.ok) {
           throw new Error(data.error || `Lỗi dọn R2 (${res.status}).`);
         }
         totalDeleted += data.deletedCount || 0;
+        totalDeletedCovers += data.deletedCoversCount || 0;
       }
 
       setCloudScanInfo((prev) =>
@@ -2092,8 +2100,9 @@ export function LocalEnrichView({
             }
           : prev
       );
+      const coverNote = totalDeletedCovers > 0 ? ` và ${totalDeletedCovers} ảnh bìa dư` : '';
       showToast(
-        `Đã dọn sạch ${totalDeleted} file MP3 trùng dư trên Cloudflare R2 (giữ nguyên 100% các bài đang phát trên App)!`
+        `Đã dọn sạch ${totalDeleted} file MP3 trùng dư${coverNote} trên Cloudflare R2 (giữ nguyên 100% các bài đang phát trên App)!`
       );
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Không thể dọn file trùng dư trên R2.');

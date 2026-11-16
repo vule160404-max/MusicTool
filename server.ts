@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetBucketCorsCommand,
   HeadBucketCommand,
   ListObjectsV2Command,
@@ -4129,6 +4130,7 @@ run().catch((err) => {
         keys?: string[];
         appUrl?: string;
         webhookUrl?: string;
+        includeOrphanCovers?: boolean;
       };
       const r2 = integrationSettings.r2;
       const r2Err = validateR2Config(r2);
@@ -4147,49 +4149,115 @@ run().catch((err) => {
       }
 
       const activeAppKeySet = new Set<string>();
+      const activeAppCoverKeySet = new Set<string>();
       for (const t of appTracks) {
         if (t.r2AudioKey) activeAppKeySet.add(t.r2AudioKey);
+        if (t.r2CoverKey) activeAppCoverKeySet.add(t.r2CoverKey);
+        if (t.coverUrl) {
+          const m = t.coverUrl.match(/\/(covers\/[^?#]+)/i);
+          if (m?.[1]) activeAppCoverKeySet.add(decodeURIComponent(m[1]));
+        }
       }
 
       const candidateKeys = Array.isArray(body.keys)
-        ? body.keys.filter((k) => typeof k === 'string' && /^tracks\/.+\.mp3$/i.test(k) && !activeAppKeySet.has(k))
+        ? Array.from(
+            new Set(
+              body.keys.filter(
+                (k) => typeof k === 'string' && /^tracks\/.+\.mp3$/i.test(k) && !activeAppKeySet.has(k)
+              )
+            )
+          )
         : [];
 
       if (candidateKeys.length === 0) {
-        res.json({ ok: true, deletedCount: 0, skippedActiveCount: 0 });
+        res.json({ ok: true, deletedCount: 0, deletedCoversCount: 0, skippedActiveCount: 0 });
         return;
       }
 
       const client = getR2Client(r2);
-      let deletedCount = 0;
-      let cursor = 0;
-      const workerCount = Math.min(10, candidateKeys.length);
-
-      await Promise.all(
-        Array.from({ length: workerCount }, async () => {
-          while (true) {
-            const idx = cursor++;
-            if (idx >= candidateKeys.length) break;
-            const key = candidateKeys[idx];
-            if (activeAppKeySet.has(key)) continue;
-            try {
-              await client.send(
-                new DeleteObjectCommand({
-                  Bucket: r2.bucketName,
-                  Key: key,
-                })
-              );
-              deletedCount++;
-            } catch {
-              // Ignore single delete error
-            }
+      const bulkDeleteKeys = async (keysToDelete: string[]): Promise<number> => {
+        let count = 0;
+        for (let i = 0; i < keysToDelete.length; i += 1000) {
+          const batch = keysToDelete.slice(i, i + 1000);
+          try {
+            const out = await client.send(
+              new DeleteObjectsCommand({
+                Bucket: r2.bucketName,
+                Delete: {
+                  Objects: batch.map((Key) => ({ Key })),
+                  Quiet: true,
+                },
+              })
+            );
+            const errorCount = Array.isArray(out.Errors) ? out.Errors.length : 0;
+            count += Math.max(0, batch.length - errorCount);
+          } catch {
+            // Fallback to concurrent single DeleteObjectCommand if DeleteObjects fails
+            let cursor = 0;
+            await Promise.all(
+              Array.from({ length: Math.min(10, batch.length) }, async () => {
+                while (true) {
+                  const idx = cursor++;
+                  if (idx >= batch.length) break;
+                  try {
+                    await client.send(new DeleteObjectCommand({ Bucket: r2.bucketName, Key: batch[idx] }));
+                    count++;
+                  } catch {
+                    // Ignore single delete error
+                  }
+                }
+              })
+            );
           }
-        })
-      );
+        }
+        return count;
+      };
+
+      const deletedCount = await bulkDeleteKeys(candidateKeys);
+
+      // Also clean up orphan cover images in covers/ that belong exclusively to deleted duplicate MP3s
+      let deletedCoversCount = 0;
+      if (body.includeOrphanCovers !== false && deletedCount > 0) {
+        try {
+          const deletedExactStemSet = new Set(
+            candidateKeys.map((k) => k.replace(/^tracks\//i, '').replace(/\.mp3$/i, ''))
+          );
+          const orphanCoverKeys: string[] = [];
+          let continuationToken: string | undefined;
+          let pages = 0;
+          while (pages < 25) {
+            pages++;
+            const listCovers = await client.send(
+              new ListObjectsV2Command({
+                Bucket: r2.bucketName,
+                Prefix: 'covers/',
+                MaxKeys: 1000,
+                ContinuationToken: continuationToken,
+              })
+            );
+            for (const obj of listCovers.Contents || []) {
+              const cKey = obj.Key || '';
+              if (!cKey || activeAppCoverKeySet.has(cKey)) continue;
+              const cStem = cKey.replace(/^covers\//i, '').replace(/\.[a-z0-9]+$/i, '');
+              if (deletedExactStemSet.has(cStem)) {
+                orphanCoverKeys.push(cKey);
+              }
+            }
+            if (!listCovers.IsTruncated || !listCovers.NextContinuationToken) break;
+            continuationToken = listCovers.NextContinuationToken;
+          }
+          if (orphanCoverKeys.length > 0) {
+            deletedCoversCount = await bulkDeleteKeys(orphanCoverKeys);
+          }
+        } catch {
+          // Ignore cover cleanup errors
+        }
+      }
 
       res.json({
         ok: true,
         deletedCount,
+        deletedCoversCount,
       });
     } catch (err) {
       res.status(500).json({
